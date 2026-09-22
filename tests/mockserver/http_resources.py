@@ -218,6 +218,32 @@ class Status(LeafResource):
         return b""
 
 
+class Vary(LeafResource):
+    """Return a different body per Accept-Language, with Vary and ETag.
+
+    The ETag is built from the language, and a matching If-None-Match
+    gets a 304 that echoes the received value back in the
+    X-Received-If-None-Match header, so that tests can check the
+    conditional headers sent by the client.
+    """
+
+    def render_GET(self, request: Request) -> bytes:
+        langs = request.requestHeaders.getRawHeaders(b"accept-language")
+        lang = langs[0] if langs else b""
+        etag = b'"lang-' + (lang or b"none") + b'"'
+        request.setHeader(b"Vary", b"Accept-Language")
+        request.setHeader(b"Cache-Control", b"max-age=3600")
+        request.setHeader(b"ETag", etag)
+        inm = request.requestHeaders.getRawHeaders(b"if-none-match")
+        if inm and inm[0] == etag:
+            request.setHeader(b"X-Received-If-None-Match", inm[0])
+            request.setResponseCode(304)
+            return b""
+        if lang == b"zh":
+            return "中文".encode()
+        return b"English"
+
+
 class Raw(LeafResource):
     def render_GET(self, request: Request) -> int:
         request.startedWriting = 1

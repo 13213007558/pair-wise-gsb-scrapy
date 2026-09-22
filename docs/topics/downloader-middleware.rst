@@ -367,6 +367,16 @@ HttpCacheMiddleware
     You can change the HTTP cache policy with the :setting:`HTTPCACHE_POLICY`
     setting. Or you can also implement your own policy.
 
+    .. versionadded:: VERSION
+
+    The built-in storage backends support the `Vary`_ response header: a
+    response that varies on request headers is stored as a separate variant
+    per combination of those request header values, and a cached variant is
+    only reused for a request with matching values. Responses with
+    ``Vary: *`` are not stored.
+
+    .. _Vary: https://www.rfc-editor.org/rfc/rfc9111#field.vary
+
     .. reqmeta:: dont_cache
 
     You can also avoid caching a response on every policy using :reqmeta:`dont_cache` meta key equals ``True``.
@@ -440,7 +450,6 @@ RFC2616 policy
     What is missing:
 
     * ``Pragma: no-cache`` support https://www.w3.org/Protocols/rfc2616/rfc2616-sec14.html#sec14.9.1
-    * ``Vary`` header support https://www.w3.org/Protocols/rfc2616/rfc2616-sec13.html#sec13.6
     * Invalidation after updates or deletes https://www.w3.org/Protocols/rfc2616/rfc2616-sec13.html#sec13.10
     * ... probably others ..
 

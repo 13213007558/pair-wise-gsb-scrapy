@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import gzip
 import json
+import os
 import random
 from typing import TYPE_CHECKING, Any, ClassVar, ParamSpec, TypeVar, cast
 from urllib.parse import urlencode
@@ -120,6 +121,26 @@ class PayloadResource(BaseResource):
         if len(data) != 100 or int(content_length[0]) != 100:
             return b"ERROR"
         return data
+
+
+class CountingResource(BaseResource):
+    """Serve a small valid PNG, logging every request to a file.
+
+    The log file path is taken from the SCRAPY_TEST_REQUEST_LOG environment
+    variable; requests are not logged if it is not set.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._payload = get_testdata("test_site", "files", "images", "scrapy.png")
+
+    def render(self, request: Request) -> bytes:
+        log_file = os.environ.get("SCRAPY_TEST_REQUEST_LOG")
+        if log_file:
+            with open(log_file, "a") as f:
+                f.write(f"{request.uri.decode()}\n")
+        request.setHeader(b"Content-Type", b"image/png")
+        return self._payload
 
 
 class LeafResource(BaseResource):

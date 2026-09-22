@@ -51,6 +51,14 @@ FileInfoOrError: TypeAlias = (
     tuple[Literal[True], FileInfo] | tuple[Literal[False], Failure]
 )
 
+
+class _RecoveredDownload:
+    """Sentinel for download failures that :meth:`MediaPipeline.media_failed`
+    recovered from by returning instead of raising."""
+
+
+_RECOVERED_DOWNLOAD = _RecoveredDownload()
+
 logger = logging.getLogger(__name__)
 
 
@@ -80,10 +88,12 @@ class MediaPipeline(ABC):
         def __init__(self, spider: Spider):
             self.spider: Spider = spider
             self.downloading: set[bytes] = set()
-            self.downloaded: dict[bytes, FileInfo | Failure] = {}
-            self.waiting: defaultdict[bytes, list[Deferred[FileInfo]]] = defaultdict(
-                list
+            self.downloaded: dict[bytes, Response | Failure | _RecoveredDownload] = (
+                {}
             )
+            self.waiting: defaultdict[
+                bytes, list[Deferred[Response | _RecoveredDownload]]
+            ] = defaultdict(list)
 
     def __init__(
         self,
@@ -174,47 +184,108 @@ class MediaPipeline(ABC):
         request.callback = NO_CALLBACK
         request.errback = None
 
-        # Return cached result if request was already seen
+        try:
+            # A failed download is shared by all items, so there is no
+            # per-item processing to do for it.
+            cached = info.downloaded.get(fp)
+            if isinstance(cached, Failure):
+                await _process_pending_io()
+                cached.raiseException()
+
+            try:
+                file_info: FileInfo | None = await ensure_awaitable(
+                    self.media_to_download(request, info, item=item)
+                )
+            except Exception:
+                logger.exception(Failure())
+                raise
+            if file_info:
+                # got a result without downloading
+                return file_info
+
+            response = await self._download(request, info, fp)
+            if isinstance(response, _RecoveredDownload):
+                # media_failed() recovered from the download failure
+                return cast("FileInfo", None)
+
+            try:
+                return await ensure_awaitable(
+                    self.media_downloaded(response, request, info, item=item)
+                )
+            except Exception:
+                self._media_failed(request, info)
+                return cast("FileInfo", None)
+        except Exception:
+            if eb is None:
+                raise
+            result = eb(Failure())
+            if isinstance(result, Failure):
+                result.raiseException()
+            return result
+
+    async def _download(
+        self, request: Request, info: SpiderInfo, fp: bytes
+    ) -> Response | _RecoveredDownload:
+        """Download *request* once and share the response with all waiters.
+
+        Download failures are raised, unless :meth:`media_failed` recovers
+        from them, in which case a sentinel is returned instead.
+        """
+        # Return the cached download result if the request was already seen
         if fp in info.downloaded:
             await _process_pending_io()
-            cached_result = info.downloaded[fp]
-            if isinstance(cached_result, Failure):
-                if eb:
-                    return eb(cached_result)
-                cached_result.raiseException()
-            return cached_result
+            cached = info.downloaded[fp]
+            if isinstance(cached, Failure):
+                cached.raiseException()
+            return cached
 
-        # Otherwise, wait for result
-        wad: Deferred[FileInfo] = Deferred()
-        if eb:
-            wad.addErrback(eb)
+        # Otherwise, wait for the download to finish
+        wad: Deferred[Response | _RecoveredDownload] = Deferred()
         info.waiting[fp].append(wad)
 
-        # Check if request is downloading right now to avoid doing it twice
+        # Check if the request is downloading right now to avoid doing it twice
         if fp in info.downloading:
             return await maybe_deferred_to_future(wad)
 
-        # Download request checking media_to_download hook output first
+        # Download the request
         info.downloading.add(fp)
         await _process_pending_io()
-        result: FileInfo | Failure
+        result: Response | Failure | _RecoveredDownload
         try:
-            file_info: FileInfo | None = await ensure_awaitable(
-                self.media_to_download(request, info, item=item)
-            )
-            if file_info:
-                # got a result without downloading
-                result = file_info
-            else:
-                # download the result
-                result = await self._check_media_to_download(request, info, item=item)
+            self._modify_media_request(request)
+            result = await self.crawler.engine.download_async(request)
         except Exception:
-            result = Failure()
-            if not _media_request_filtered(result):
-                logger.exception(result)
+            try:
+                self._media_failed(request, info)
+            except Exception:
+                result = Failure()
+            else:
+                result = _RECOVERED_DOWNLOAD
         await _process_pending_io()
         self._cache_result_and_execute_waiters(result, fp, info)
         return await maybe_deferred_to_future(wad)  # it must return wad at last
+
+    def _media_failed(self, request: Request, info: SpiderInfo) -> None:
+        """Run :meth:`media_failed` for the exception being handled.
+
+        Return if :meth:`media_failed` recovered from the failure by
+        returning, re-raise the failure exception otherwise.
+        """
+        try:
+            result = self.media_failed(Failure(), request, info)
+        except Exception:
+            failure = Failure()
+            if not _media_request_filtered(failure):
+                logger.exception(failure)
+            raise
+        if isinstance(result, Failure):
+            warnings.warn(
+                f"{global_object_name(self.media_failed)} returned a Failure instance."
+                f" This is deprecated, please raise an exception instead, e.g. via failure.raiseException().",
+                category=ScrapyDeprecationWarning,
+                stacklevel=2,
+            )
+            result.raiseException()
 
     def _modify_media_request(self, request: Request) -> None:
         if self.handle_httpstatus_list:
@@ -222,28 +293,11 @@ class MediaPipeline(ABC):
         else:
             request.meta["handle_httpstatus_all"] = True
 
-    async def _check_media_to_download(
-        self, request: Request, info: SpiderInfo, item: Any
-    ) -> FileInfo:
-        try:
-            self._modify_media_request(request)
-            response = await self.crawler.engine.download_async(request)
-            return await ensure_awaitable(
-                self.media_downloaded(response, request, info, item=item)
-            )
-        except Exception:
-            failure = self.media_failed(Failure(), request, info)
-            if isinstance(failure, Failure):
-                warnings.warn(
-                    f"{global_object_name(self.media_failed)} returned a Failure instance."
-                    f" This is deprecated, please raise an exception instead, e.g. via failure.raiseException().",
-                    category=ScrapyDeprecationWarning,
-                    stacklevel=2,
-                )
-                failure.raiseException()
-
     def _cache_result_and_execute_waiters(
-        self, result: FileInfo | Failure, fp: bytes, info: SpiderInfo
+        self,
+        result: Response | Failure | _RecoveredDownload,
+        fp: bytes,
+        info: SpiderInfo,
     ) -> None:
         if isinstance(result, Failure):
             # minimize cached information for failure

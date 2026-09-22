@@ -1,3 +1,4 @@
+import asyncio
 import base64
 import dataclasses
 import logging
@@ -411,6 +412,90 @@ class TestFilesPipeline:
         path = Path(self.tempdir) / result["files"][0]["path"]
         assert path.exists()
         assert path.read_bytes() == b"data"
+
+    @coroutine_test
+    async def test_shared_download_processed_per_item(self) -> None:
+        """Two items sharing a file URL download it once, but file_path() and
+        file_downloaded() run for each item with its own data."""
+        download_count = 0
+
+        async def counting_download_func(request: Request) -> Response:
+            nonlocal download_count
+            download_count += 1
+            return Response(request.url, status=200, body=b"data")
+
+        class CategoryFilesPipeline(FilesPipeline):
+            def __init__(self, *args: Any, **kwargs: Any):
+                super().__init__(*args, **kwargs)
+                self.file_downloaded_items: list[Any] = []
+
+            def file_path(self, request, response=None, info=None, *, item=None):
+                return f"{item['category']}/file"
+
+            def file_downloaded(self, response, request, info, *, item=None):
+                self.file_downloaded_items.append(item)
+                return super().file_downloaded(response, request, info, item=item)
+
+        pipeline = self._create_pipeline(CategoryFilesPipeline)
+        assert isinstance(pipeline, CategoryFilesPipeline)
+        pipeline.crawler.engine = MagicMock(download_async=counting_download_func)
+        item1 = {"category": "cat1", "file_urls": ["http://example.com/file"]}
+        item2 = {"category": "cat2", "file_urls": ["http://example.com/file"]}
+        result1, result2 = await asyncio.gather(
+            pipeline.process_item(item1), pipeline.process_item(item2)
+        )
+
+        assert download_count == 1
+        assert result1["files"][0]["path"] == "cat1/file"
+        assert result2["files"][0]["path"] == "cat2/file"
+        assert result1["files"][0]["checksum"] == result2["files"][0]["checksum"]
+        # each item gets its own result object
+        assert result1["files"][0] is not result2["files"][0]
+        result1["files"][0]["note"] = "changed"
+        assert "note" not in result2["files"][0]
+        # file_downloaded() ran for each item with its own data
+        assert sorted(item["category"] for item in pipeline.file_downloaded_items) == [
+            "cat1",
+            "cat2",
+        ]
+        # each file was saved under the directory of its own item
+        assert (Path(self.tempdir) / "cat1" / "file").read_bytes() == b"data"
+        assert (Path(self.tempdir) / "cat2" / "file").read_bytes() == b"data"
+
+    @coroutine_test
+    async def test_per_item_failure_isolation(self) -> None:
+        """A failing item does not affect the results of a successful item
+        sharing the same download."""
+        download_count = 0
+
+        async def counting_download_func(request: Request) -> Response:
+            nonlocal download_count
+            download_count += 1
+            return Response(request.url, status=200, body=b"data")
+
+        class FailingCategoryFilesPipeline(FilesPipeline):
+            def file_path(self, request, response=None, info=None, *, item=None):
+                return f"{item['category']}/file"
+
+            def file_downloaded(self, response, request, info, *, item=None):
+                if item["category"] == "cat2":
+                    raise FileException("cannot save")
+                return super().file_downloaded(response, request, info, item=item)
+
+        pipeline = self._create_pipeline(FailingCategoryFilesPipeline)
+        pipeline.crawler.engine = MagicMock(download_async=counting_download_func)
+        item1 = {"category": "cat1", "file_urls": ["http://example.com/file"]}
+        item2 = {"category": "cat2", "file_urls": ["http://example.com/file"]}
+        result1, result2 = await asyncio.gather(
+            pipeline.process_item(item1), pipeline.process_item(item2)
+        )
+
+        assert download_count == 1
+        assert result1["files"][0]["path"] == "cat1/file"
+        assert result1["files"][0]["status"] == "downloaded"
+        assert result2["files"] == []
+        assert (Path(self.tempdir) / "cat1" / "file").exists()
+        assert not (Path(self.tempdir) / "cat2" / "file").exists()
 
     def test_file_path_from_item(self):
         """

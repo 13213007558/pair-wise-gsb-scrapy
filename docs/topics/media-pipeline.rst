@@ -27,7 +27,11 @@ The Images Pipeline has a few extra functions for processing images:
 The pipelines also keep an internal queue of those media URLs which are currently
 being scheduled for download, and connect those responses that arrive containing
 the same media to that queue. This avoids downloading the same media more than
-once when it's shared by several items.
+once when it's shared by several items. Item-level processing still runs once
+per item, though: each item gets its own
+:meth:`~scrapy.pipelines.files.FilesPipeline.file_path` and
+``file_downloaded`` calls and its own results, so different items can
+store the same file in different locations.
 
 Using the Files Pipeline
 ========================

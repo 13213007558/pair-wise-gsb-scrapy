@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import dataclasses
 import io
 import random
@@ -10,6 +11,7 @@ from shutil import rmtree
 from tempfile import mkdtemp
 from types import SimpleNamespace
 from typing import Any
+from unittest.mock import MagicMock
 
 import attr
 import pytest
@@ -239,6 +241,58 @@ class TestImagesPipeline:
         name = "3fd165099d8e71b8a48b2683946e64dbfad8b52d.jpg"
         assert Path(self.tempdir, "full", name).read_bytes() == buf.getvalue()
         assert Path(self.tempdir, "thumbs", "small", name).exists()
+
+    @coroutine_test
+    async def test_shared_download_processed_per_item(self) -> None:
+        """Two items sharing an image URL download it once, but the original
+        image and its thumbnails are stored once per item, each under the
+        directory of its own item."""
+        download_count = 0
+        _, buf = _create_image("JPEG", "RGB", (50, 50), (0, 0, 0))
+        body = buf.getvalue()
+
+        async def counting_download_func(request: Request) -> Response:
+            nonlocal download_count
+            download_count += 1
+            return Response(request.url, status=200, body=body)
+
+        class CategoryImagesPipeline(ImagesPipeline):
+            def file_path(self, request, response=None, info=None, *, item=None):
+                return f"{item['category']}/full/image.jpg"
+
+            def thumb_path(
+                self, request, thumb_id, response=None, info=None, *, item=None
+            ):
+                return f"{item['category']}/thumbs/{thumb_id}/image.jpg"
+
+        crawler = get_crawler(
+            None,
+            {
+                "IMAGES_STORE": self.tempdir,
+                "IMAGES_THUMBS": {"small": (20, 20)},
+            },
+        )
+        crawler.spider = crawler._create_spider()
+        crawler.engine = MagicMock(download_async=counting_download_func)
+        pipeline = build_from_crawler(CategoryImagesPipeline, crawler)
+        pipeline.open_spider()
+        item1 = {"category": "cat1", "image_urls": ["http://example.com/image"]}
+        item2 = {"category": "cat2", "image_urls": ["http://example.com/image"]}
+        result1, result2 = await asyncio.gather(
+            pipeline.process_item(item1), pipeline.process_item(item2)
+        )
+
+        assert download_count == 1
+        assert result1["images"][0]["path"] == "cat1/full/image.jpg"
+        assert result2["images"][0]["path"] == "cat2/full/image.jpg"
+        assert result1["images"][0] is not result2["images"][0]
+        for category in ("cat1", "cat2"):
+            assert (
+                Path(self.tempdir) / category / "full" / "image.jpg"
+            ).read_bytes() == body
+            assert (
+                Path(self.tempdir) / category / "thumbs" / "small" / "image.jpg"
+            ).is_file()
 
     def test_convert_image(self):
         SIZE = (100, 100)

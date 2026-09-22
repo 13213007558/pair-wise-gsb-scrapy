@@ -642,3 +642,64 @@ class TestMediaFailedFailure(TestBaseMediaPipeline):
             "request_errback",
             "item_completed",
         ]
+
+
+class MediaToDownloadFailurePipeline(MockedMediaPipeline):
+    def media_to_download(
+        self, request: Request, info: MediaPipeline.SpiderInfo, *, item: Any = None
+    ) -> Deferred[FileInfo | None] | None:
+        raise ValueError("boom")
+
+
+class TestMediaToDownloadFailure(TestBaseMediaPipeline):
+    """A media_to_download() error is a failure of only the current item."""
+
+    pipeline_class = MediaToDownloadFailurePipeline
+
+    @coroutine_test
+    async def test_result_failure(self):
+        self.pipe.LOG_FAILED_RESULTS = False
+        req = Request("http://url1")
+        new_item = await self.pipe.process_item({"requests": req})
+        assert len(new_item["results"]) == 1
+        assert new_item["results"][0][0] is False
+        assert isinstance(new_item["results"][0][1], Failure)
+        assert isinstance(new_item["results"][0][1].value, ValueError)
+
+
+class MediaDownloadedRecoveredPipeline(MockedMediaPipeline):
+    def media_downloaded(
+        self,
+        response: Response,
+        request: Request,
+        info: MediaPipeline.SpiderInfo,
+        *,
+        item: Any = None,
+    ) -> FileInfo | Awaitable[FileInfo]:
+        self._mockcalled.append("media_downloaded")
+        raise ValueError("boom")
+
+    def media_failed(  # type: ignore[override]
+        self, failure: Failure, request: Request, info: MediaPipeline.SpiderInfo
+    ) -> None:
+        self._mockcalled.append("media_failed")
+
+
+class TestMediaDownloadedRecovered(TestBaseMediaPipeline):
+    """Test that media_failed() can recover from a media_downloaded() error
+    by returning instead of raising."""
+
+    pipeline_class = MediaDownloadedRecoveredPipeline
+
+    @coroutine_test
+    async def test_result_none(self):
+        req = Request("http://url1", meta={"response": Response("http://url1")})
+        new_item = await self.pipe.process_item({"requests": req})
+        assert new_item["results"] == [(True, None)]
+        assert self.mocked_pipe._mockcalled == [
+            "get_media_requests",
+            "media_to_download",
+            "media_downloaded",
+            "media_failed",
+            "item_completed",
+        ]

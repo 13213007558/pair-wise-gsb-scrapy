@@ -235,6 +235,42 @@ class Raw(LeafResource):
         request.finish()
 
 
+class VaryResource(LeafResource):
+    """Serve a different body per Accept-Language value, with an ETag per
+    variant, and record the selecting and conditional request headers."""
+
+    received: ClassVar[list[dict[bytes, bytes | None]]] = []
+
+    _bodies: ClassVar[dict[bytes, bytes]] = {
+        b"en": b"Hello!",
+        b"zh": "\u4f60\u597d\uff01".encode(),
+    }
+
+    def render_GET(self, request: Request) -> bytes:
+        def header(name: bytes) -> bytes | None:
+            values = request.requestHeaders.getRawHeaders(name)
+            return values[0] if values else None
+
+        language = header(b"accept-language")
+        if language not in self._bodies:
+            language = b"en"
+        etag = b'"' + language + b'-v1"'
+        self.received.append(
+            {
+                b"accept-language": header(b"accept-language"),
+                b"if-none-match": header(b"if-none-match"),
+            }
+        )
+        request.setHeader(b"Vary", b"Accept-Language")
+        request.setHeader(b"ETag", etag)
+        request.setHeader(b"Cache-Control", b"max-age=0")
+        request.setHeader(b"Content-Type", b"text/plain; charset=utf-8")
+        if header(b"if-none-match") == etag:
+            request.setResponseCode(304)
+            return b""
+        return self._bodies[language]
+
+
 class BadHeader(LeafResource):
     """Sends a response with a bad header line, one with no colon in it, like
     some servers do, between two good ones.

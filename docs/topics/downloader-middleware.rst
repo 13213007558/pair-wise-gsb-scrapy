@@ -440,9 +440,35 @@ RFC2616 policy
     What is missing:
 
     * ``Pragma: no-cache`` support https://www.w3.org/Protocols/rfc2616/rfc2616-sec14.html#sec14.9.1
-    * ``Vary`` header support https://www.w3.org/Protocols/rfc2616/rfc2616-sec13.html#sec13.6
     * Invalidation after updates or deletes https://www.w3.org/Protocols/rfc2616/rfc2616-sec13.html#sec13.10
     * ... probably others ..
+
+
+.. _httpcache-vary:
+
+Caching response variants
+~~~~~~~~~~~~~~~~~~~~~~~~~
+
+.. versionadded:: VERSION
+
+When a response carries a Vary_ header, the built-in storage backends
+cache it as a *variant* of the requested URL: the response is stored
+alongside the values of the request headers that the ``Vary`` header
+names, and it is only served again for requests whose values for those
+headers match. Header names are matched case-insensitively, and a missing
+header is not the same as a header with an empty value.
+
+A ``Vary: *`` response cannot be reused, so it only invalidates the
+variants cached for the same request. When a response changes the set of
+headers in its ``Vary`` header, including through a ``304 Not Modified``
+response, the variants cached under the previous set are discarded.
+
+Cache entries written by Scrapy versions without variant support have no
+variant index. They are served for any request, as those versions did,
+until a response with a ``Vary`` header is cached for the same request
+fingerprint.
+
+.. _Vary: https://www.rfc-editor.org/rfc/rfc9111#name-vary
 
 
 .. _httpcache-storage-fs:
@@ -474,6 +500,12 @@ Filesystem storage backend (default)
     *   ``pickled_meta`` - the same metadata in ``meta`` but pickled for more
         efficient deserialization
 
+    When a response has a ``Vary`` header, it is stored as a variant (see
+    :ref:`httpcache-vary`): the request directory contains a
+    :file:`vary_index` file with the pickled vary index, and a
+    :file:`variants` subdirectory with one directory per cached variant,
+    each containing the files listed above.
+
     The directory name is made from the request fingerprint (see
     ``scrapy.utils.request.fingerprint``), and one level of subdirectories is
     used to avoid creating too many files into the same directory (which is
@@ -492,6 +524,9 @@ DBM storage backend
 
     By default, it uses the :mod:`dbm`, but you can change it with the
     :setting:`HTTPCACHE_DBM_MODULE` setting.
+
+    Responses with a ``Vary`` header are cached as variants (see
+    :ref:`httpcache-vary`).
 
 .. _httpcache-storage-custom:
 

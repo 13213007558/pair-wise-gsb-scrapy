@@ -1,19 +1,21 @@
 from __future__ import annotations
 
 import gzip
+import hashlib
 import logging
 import pickle
+import shutil
 from datetime import timezone
 from email.utils import parsedate_to_datetime
 from importlib import import_module
 from pathlib import Path
 from time import time
-from typing import IO, TYPE_CHECKING, Any, Concatenate, cast
+from typing import IO, TYPE_CHECKING, Any, Concatenate, TypedDict, cast
 from weakref import WeakKeyDictionary
 
 from w3lib.http import headers_dict_to_raw, headers_raw_to_dict
 
-from scrapy.http import Response
+from scrapy.http import Headers, Response
 from scrapy.utils.httpobj import urlparse_cached
 from scrapy.utils.project import data_path
 from scrapy.utils.python import to_bytes, to_unicode
@@ -31,6 +33,59 @@ if TYPE_CHECKING:
 
 
 logger = logging.getLogger(__name__)
+
+
+_VaryKey = tuple[tuple[bytes, ...], ...]
+
+
+class _VaryIndex(TypedDict):
+    """Index of the cached variants of a request fingerprint.
+
+    "vary" holds the field names of the Vary response header that the cached
+    variants were stored under, and "variants" the vary key of each cached
+    variant.
+    """
+
+    vary: tuple[bytes, ...]
+    variants: list[_VaryKey]
+
+
+def _vary_names(headers: Headers) -> tuple[bytes, ...] | None:
+    """Return the sorted, lowercased field names of the Vary header of
+    *headers*, or ``None`` if there is none."""
+    names: set[bytes] = set()
+    for line in headers.getlist(b"Vary"):
+        names.update(name.strip().lower() for name in line.split(b","))
+    names.discard(b"")
+    if not names:
+        return None
+    return tuple(sorted(names))
+
+
+def _vary_key(request: Request, names: tuple[bytes, ...]) -> _VaryKey:
+    """Return the values of the *names* request headers.
+
+    Two requests can share a cached response only if their vary keys are
+    equal. A missing header and a header with an empty value have different
+    keys, and headers with multiple lines keep all their values.
+    """
+    return tuple(tuple(request.headers.getlist(name)) for name in names)
+
+
+def _variant_id(vary_key: _VaryKey) -> str:
+    return hashlib.sha1(pickle.dumps(vary_key, protocol=4)).hexdigest()  # noqa: S324
+
+
+def _loads_vary_index(data: bytes) -> _VaryIndex | None:
+    """Return the vary index stored in *data*, or ``None`` if it is missing
+    or unreadable, so that a corrupted index is handled as a cache miss."""
+    try:
+        index = pickle.loads(data)  # noqa: S301
+    except Exception:
+        return None
+    if not isinstance(index, dict) or "vary" not in index or "variants" not in index:
+        return None
+    return cast("_VaryIndex", index)
 
 
 class DummyPolicy:
@@ -281,24 +336,78 @@ class DbmCacheStorage:
         self, spider: Spider, request: Request, response: Response
     ) -> None:
         key = self._fingerprinter.fingerprint(request).hex()
-        self.db[f"{key}_data"] = pickle.dumps(response.to_dict(), protocol=4)
-        self.db[f"{key}_time"] = str(time())
+        vary = _vary_names(response.headers)
+        if vary is None or b"*" in vary:
+            # A response without Vary replaces any cached variants, and a
+            # "Vary: *" response cannot be reused, so it only invalidates.
+            self._delete_cached_response(key)
+            if vary is None:
+                self.db[f"{key}_data"] = pickle.dumps(response.to_dict(), protocol=4)
+                self.db[f"{key}_time"] = str(time())
+            return
+        index = self._read_vary_index(key)
+        if index is None or index["vary"] != vary:
+            # Variants cached under a different Vary set cannot be matched
+            # against new requests.
+            self._delete_cached_response(key)
+            index = {"vary": vary, "variants": []}
+        vary_key = _vary_key(request, vary)
+        if vary_key not in index["variants"]:
+            index["variants"].append(vary_key)
+        variant_id = _variant_id(vary_key)
+        self.db[f"{key}_data_{variant_id}"] = pickle.dumps(
+            response.to_dict(), protocol=4
+        )
+        self.db[f"{key}_time_{variant_id}"] = str(time())
+        self.db[f"{key}_vary"] = pickle.dumps(index, protocol=4)
 
     def _read_data(
         self, spider: Spider, request: Request
     ) -> tuple[dict[str, Any], float] | None:
         key = self._fingerprinter.fingerprint(request).hex()
+        index = self._read_vary_index(key)
+        if index is not None:
+            vary_key = _vary_key(request, index["vary"])
+            if vary_key not in index["variants"]:
+                return None  # no matching variant
+            variant_id = _variant_id(vary_key)
+            return self._read_entry(
+                f"{key}_data_{variant_id}", f"{key}_time_{variant_id}"
+            )
+        return self._read_entry(f"{key}_data", f"{key}_time")
+
+    def _read_entry(
+        self, data_key: str, time_key: str
+    ) -> tuple[dict[str, Any], float] | None:
         db = self.db
-        tkey = f"{key}_time"
-        if tkey not in db:
+        if time_key not in db:
             return None  # not found
 
-        ts = float(db[tkey])
+        ts = float(db[time_key])
         if 0 < self.expiration_secs < time() - ts:
             return None  # expired
 
-        data = cast("dict[str, Any]", pickle.loads(db[f"{key}_data"]))  # noqa: S301
+        data = cast("dict[str, Any]", pickle.loads(db[data_key]))  # noqa: S301
         return data, ts
+
+    def _read_vary_index(self, key: str) -> _VaryIndex | None:
+        index_key = f"{key}_vary"
+        if index_key not in self.db:
+            return None
+        return _loads_vary_index(self.db[index_key])
+
+    def _delete_cached_response(self, key: str) -> None:
+        db = self.db
+        if f"{key}_vary" not in db:
+            for entry_key in (f"{key}_data", f"{key}_time"):
+                if entry_key in db:
+                    del db[entry_key]
+            return
+        prefix = f"{key}_"
+        for raw_key in list(db.keys()):
+            entry_key = raw_key.decode() if isinstance(raw_key, bytes) else raw_key
+            if entry_key.startswith(prefix):
+                del db[entry_key]
 
 
 class FilesystemCacheStorage:
@@ -327,10 +436,16 @@ class FilesystemCacheStorage:
 
     def retrieve_response(self, spider: Spider, request: Request) -> Response | None:
         """Return response if present in cache, or None otherwise."""
-        metadata = self._read_meta(spider, request)
+        rpath = Path(self._get_request_path(spider, request))
+        index = self._read_vary_index(rpath)
+        if index is not None:
+            vary_key = _vary_key(request, index["vary"])
+            if vary_key not in index["variants"]:
+                return None  # no matching variant
+            rpath = rpath / "variants" / _variant_id(vary_key)
+        metadata = self._read_meta(rpath)
         if metadata is None:
             return None  # not cached
-        rpath = Path(self._get_request_path(spider, request))
         with self._open(rpath / "response_body", "rb") as f:
             body = f.read()
         with self._open(rpath / "response_headers", "rb") as f:
@@ -353,6 +468,32 @@ class FilesystemCacheStorage:
     ) -> None:
         """Store the given response in the cache."""
         rpath = Path(self._get_request_path(spider, request))
+        vary = _vary_names(response.headers)
+        if vary is None or b"*" in vary:
+            # A response without Vary replaces any cached variants, and a
+            # "Vary: *" response cannot be reused, so it only invalidates.
+            self._remove_cached_response(rpath)
+            if vary is None:
+                self._write_response(rpath, request, response)
+            return
+        index = self._read_vary_index(rpath)
+        if index is None or index["vary"] != vary:
+            # Variants cached under a different Vary set cannot be matched
+            # against new requests.
+            self._remove_cached_response(rpath)
+            index = {"vary": vary, "variants": []}
+        vary_key = _vary_key(request, vary)
+        if vary_key not in index["variants"]:
+            index["variants"].append(vary_key)
+        self._write_response(
+            rpath / "variants" / _variant_id(vary_key), request, response
+        )
+        with self._open(rpath / "vary_index", "wb") as f:
+            pickle.dump(index, f, protocol=4)
+
+    def _write_response(
+        self, rpath: Path, request: Request, response: Response
+    ) -> None:
         if not rpath.exists():
             rpath.mkdir(parents=True)
         metadata = {
@@ -386,8 +527,28 @@ class FilesystemCacheStorage:
         key = self._fingerprinter.fingerprint(request).hex()
         return str(Path(self.cachedir, spider.name, key[0:2], key))
 
-    def _read_meta(self, spider: Spider, request: Request) -> dict[str, Any] | None:
-        rpath = Path(self._get_request_path(spider, request))
+    def _read_vary_index(self, rpath: Path) -> _VaryIndex | None:
+        try:
+            with self._open(rpath / "vary_index", "rb") as f:
+                return _loads_vary_index(f.read())
+        except OSError:
+            return None  # no vary index
+
+    def _remove_cached_response(self, rpath: Path) -> None:
+        shutil.rmtree(rpath / "variants", ignore_errors=True)
+        for name in (
+            "vary_index",
+            "meta",
+            "pickled_meta",
+            "response_body",
+            "response_headers",
+            "response_data",
+            "request_headers",
+            "request_body",
+        ):
+            (rpath / name).unlink(missing_ok=True)
+
+    def _read_meta(self, rpath: Path) -> dict[str, Any] | None:
         metapath = rpath / "pickled_meta"
         if not metapath.exists():
             return None  # not found

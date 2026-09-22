@@ -20,11 +20,14 @@ from scrapy.http import HtmlResponse, Request, Response
 from scrapy.spiders import Spider
 from scrapy.utils.misc import build_from_crawler
 from scrapy.utils.test import get_crawler
+from tests.mockserver.http_resources import VaryResource
+from tests.utils.decorators import coroutine_test
 
 if TYPE_CHECKING:
-    from collections.abc import Generator
+    from collections.abc import AsyncIterator, Generator
 
     from scrapy.crawler import Crawler
+    from tests.mockserver.http import MockServer
 
 
 class CustomResponse(Response):
@@ -123,6 +126,20 @@ class StorageTestMixin(TestBase):
         self, storage: Any, spider: Spider, request: Request
     ) -> None:
         """Rewrite the cache entry of *request* as Scrapy 2.14 would have."""
+        raise NotImplementedError
+
+    def _corrupt_vary_index(
+        self, storage: Any, spider: Spider, request: Request, payload: bytes
+    ) -> None:
+        """Overwrite the vary index of the cache entry of *request* with
+        *payload*."""
+        raise NotImplementedError
+
+    def _store_legacy_entry(
+        self, storage: Any, spider: Spider, request: Request, response: Response
+    ) -> None:
+        """Write *response* to the cache as a Scrapy version without
+        variant support would have, i.e. with no vary index."""
         raise NotImplementedError
 
     def test_storage(self):
@@ -231,6 +248,237 @@ class StorageTestMixin(TestBase):
             assert isinstance(cached_response, HtmlResponse)
             self.assertEqualResponse(self.response, cached_response)
 
+    def test_storage_vary(self):
+        """Responses with a Vary header are cached as variants, selected by
+        the values of the request headers that the Vary header names."""
+        with self._storage() as (storage, crawler):
+            spider = crawler.spider
+            url = self.request.url
+            headers = {"Vary": "Accept-Language", "Content-Type": "text/html"}
+            en_request = Request(url, headers={"Accept-Language": "en"})
+            zh_request = Request(url, headers={"Accept-Language": "zh"})
+            en_response = Response(url, headers=headers, body=b"English")
+            zh_response = Response(url, headers=headers, body=b"Chinese")
+            storage.store_response(spider, en_request, en_response)
+            storage.store_response(spider, zh_request, zh_response)
+            self.assertEqualResponse(
+                en_response, storage.retrieve_response(spider, en_request)
+            )
+            self.assertEqualResponse(
+                zh_response, storage.retrieve_response(spider, zh_request)
+            )
+
+            # Requests with other or no Accept-Language values match nothing.
+            fr_request = Request(url, headers={"Accept-Language": "fr"})
+            assert storage.retrieve_response(spider, fr_request) is None
+            assert storage.retrieve_response(spider, Request(url)) is None
+
+            # Storing again under the same vary key replaces the variant.
+            en_response2 = en_response.replace(body=b"English v2")
+            storage.store_response(spider, en_request, en_response2)
+            self.assertEqualResponse(
+                en_response2, storage.retrieve_response(spider, en_request)
+            )
+            self.assertEqualResponse(
+                zh_response, storage.retrieve_response(spider, zh_request)
+            )
+
+    def test_storage_vary_across_reopens(self):
+        """Variants survive closing and reopening the storage."""
+        url = self.request.url
+        headers = {"Vary": "Accept-Language", "Content-Type": "text/html"}
+        en_request = Request(url, headers={"Accept-Language": "en"})
+        zh_request = Request(url, headers={"Accept-Language": "zh"})
+        en_response = Response(url, headers=headers, body=b"English")
+        zh_response = Response(url, headers=headers, body=b"Chinese")
+        with self._storage() as (storage, crawler):
+            storage.store_response(crawler.spider, en_request, en_response)
+            storage.store_response(crawler.spider, zh_request, zh_response)
+        with self._storage() as (storage, crawler):
+            self.assertEqualResponse(
+                en_response, storage.retrieve_response(crawler.spider, en_request)
+            )
+            self.assertEqualResponse(
+                zh_response, storage.retrieve_response(crawler.spider, zh_request)
+            )
+
+    def test_storage_vary_header_names_case_insensitive(self):
+        """Both the Vary field names and the request header names are
+        case-insensitive."""
+        with self._storage() as (storage, crawler):
+            spider = crawler.spider
+            url = self.request.url
+            response = Response(
+                url,
+                headers={"Vary": "ACCEPT-language", "Content-Type": "text/html"},
+                body=b"English",
+            )
+            request = Request(url, headers={"accept-LANGUAGE": "en"})
+            storage.store_response(spider, request, response)
+            request2 = Request(url, headers={"Accept-Language": "en"})
+            self.assertEqualResponse(
+                response, storage.retrieve_response(spider, request2)
+            )
+
+    def test_storage_vary_missing_vs_empty_header(self):
+        """A missing header and a header with an empty value select
+        different variants."""
+        with self._storage() as (storage, crawler):
+            spider = crawler.spider
+            url = self.request.url
+            headers = {"Vary": "Accept-Language", "Content-Type": "text/html"}
+            empty_request = Request(url, headers={"Accept-Language": ""})
+            empty_response = Response(url, headers=headers, body=b"empty")
+            storage.store_response(spider, empty_request, empty_response)
+            self.assertEqualResponse(
+                empty_response, storage.retrieve_response(spider, empty_request)
+            )
+            assert storage.retrieve_response(spider, Request(url)) is None
+
+    def test_storage_vary_multi_value_header(self):
+        """All lines of a multi-line request header are part of the vary
+        key."""
+        with self._storage() as (storage, crawler):
+            spider = crawler.spider
+            url = self.request.url
+            headers = {"Vary": "Accept-Language", "Content-Type": "text/html"}
+            request = Request(
+                url, headers=[("Accept-Language", "en"), ("Accept-Language", "zh")]
+            )
+            response = Response(url, headers=headers, body=b"body")
+            storage.store_response(spider, request, response)
+            same_request = Request(
+                url, headers=[("Accept-Language", "en"), ("Accept-Language", "zh")]
+            )
+            self.assertEqualResponse(
+                response, storage.retrieve_response(spider, same_request)
+            )
+            single_request = Request(url, headers={"Accept-Language": "en"})
+            assert storage.retrieve_response(spider, single_request) is None
+            reversed_request = Request(
+                url, headers=[("Accept-Language", "zh"), ("Accept-Language", "en")]
+            )
+            assert storage.retrieve_response(spider, reversed_request) is None
+
+    def test_storage_vary_star(self):
+        """A 'Vary: *' response cannot be reused, and it invalidates the
+        cached variants."""
+        with self._storage() as (storage, crawler):
+            spider = crawler.spider
+            url = self.request.url
+            request = Request(url, headers={"Accept-Language": "en"})
+            star_response = Response(url, headers={"Vary": "*"}, body=b"star")
+            storage.store_response(spider, request, star_response)
+            assert storage.retrieve_response(spider, request) is None
+
+            response = Response(
+                url,
+                headers={"Vary": "Accept-Language", "Content-Type": "text/html"},
+                body=b"English",
+            )
+            storage.store_response(spider, request, response)
+            storage.store_response(spider, request, star_response)
+            assert storage.retrieve_response(spider, request) is None
+
+    def test_storage_vary_set_change_invalidates(self):
+        """Variants cached under a different Vary set are discarded."""
+        with self._storage() as (storage, crawler):
+            spider = crawler.spider
+            url = self.request.url
+            other_request = Request("http://www.example.com/other")
+            other_response = Response(
+                other_request.url,
+                headers={"Content-Type": "text/html"},
+                body=b"other",
+            )
+            storage.store_response(spider, other_request, other_response)
+
+            en_request = Request(url, headers={"Accept-Language": "en"})
+            en_response = Response(
+                url,
+                headers={"Vary": "Accept-Language", "Content-Type": "text/html"},
+                body=b"English",
+            )
+            storage.store_response(spider, en_request, en_response)
+
+            gzip_request = Request(url, headers={"Accept-Encoding": "gzip"})
+            gzip_response = Response(
+                url,
+                headers={"Vary": "Accept-Encoding", "Content-Type": "text/html"},
+                body=b"gzip",
+            )
+            storage.store_response(spider, gzip_request, gzip_response)
+
+            assert storage.retrieve_response(spider, en_request) is None
+            self.assertEqualResponse(
+                gzip_response, storage.retrieve_response(spider, gzip_request)
+            )
+            # Entries of other requests are left alone.
+            self.assertEqualResponse(
+                other_response, storage.retrieve_response(spider, other_request)
+            )
+
+    def test_storage_vary_replaced_by_non_varying_response(self):
+        """A response without a Vary header replaces the cached variants."""
+        with self._storage() as (storage, crawler):
+            spider = crawler.spider
+            url = self.request.url
+            en_request = Request(url, headers={"Accept-Language": "en"})
+            en_response = Response(
+                url,
+                headers={"Vary": "Accept-Language", "Content-Type": "text/html"},
+                body=b"English",
+            )
+            storage.store_response(spider, en_request, en_response)
+
+            response = Response(
+                url, headers={"Content-Type": "text/html"}, body=b"plain"
+            )
+            storage.store_response(spider, self.request, response)
+            self.assertEqualResponse(
+                response, storage.retrieve_response(spider, en_request)
+            )
+
+    def test_storage_legacy_entry_with_vary(self):
+        """Cache entries written before variant support have no vary index
+        and are served for any request, even if the cached response has a
+        Vary header."""
+        with self._storage() as (storage, crawler):
+            spider = crawler.spider
+            response = Response(
+                self.request.url,
+                headers={"Vary": "Accept-Language", "Content-Type": "text/html"},
+                body=b"legacy",
+            )
+            self._store_legacy_entry(storage, spider, self.request, response)
+            request = Request(self.request.url, headers={"Accept-Language": "zh"})
+            self.assertEqualResponse(
+                response, storage.retrieve_response(spider, request)
+            )
+
+    @pytest.mark.parametrize(
+        "payload", [b"not a pickle", pickle.dumps(["not", "a", "vary", "index"])]
+    )
+    def test_corrupted_vary_index(self, payload):
+        """An unreadable vary index is handled as a cache miss, and storing
+        a response again fixes the cache entry."""
+        with self._storage() as (storage, crawler):
+            spider = crawler.spider
+            url = self.request.url
+            request = Request(url, headers={"Accept-Language": "en"})
+            response = Response(
+                url,
+                headers={"Vary": "Accept-Language", "Content-Type": "text/html"},
+                body=b"English",
+            )
+            storage.store_response(spider, request, response)
+            self._corrupt_vary_index(storage, spider, request, payload)
+            assert storage.retrieve_response(spider, request) is None
+            storage.store_response(spider, request, response)
+            self.assertEqualResponse(
+                response, storage.retrieve_response(spider, request)
+            )
+
 
 class PolicyTestMixin(TestBase):
     """Mixin containing policy-specific test methods."""
@@ -266,6 +514,32 @@ class PolicyTestMixin(TestBase):
                     mw.storage.retrieve_response(mw.crawler.spider, self.request),
                     self.response.__class__,
                 )
+
+    def test_middleware_vary(self):
+        # Responses to requests that only differ in the headers named by
+        # the response Vary header are cached as separate variants.
+        url = "http://www.example.com"
+        en_request = Request(url, headers={"Accept-Language": "en"})
+        zh_request = Request(url, headers={"Accept-Language": "zh"})
+        fr_request = Request(url, headers={"Accept-Language": "fr"})
+        headers = {"Vary": "Accept-Language", "Expires": self.tomorrow}
+        en_response = Response(url, headers=headers, body=b"English")
+        zh_response = Response(url, headers=headers, body=b"Chinese")
+        with self._middleware() as mw:
+            assert mw.process_request(en_request) is None
+            mw.process_response(en_request, en_response)
+            assert mw.process_request(zh_request) is None
+            mw.process_response(zh_request, zh_response)
+
+            en_cached = mw.process_request(en_request)
+            assert isinstance(en_cached, Response)
+            assert en_cached.body == b"English"
+            assert "cached" in en_cached.flags
+            zh_cached = mw.process_request(zh_request)
+            assert isinstance(zh_cached, Response)
+            assert zh_cached.body == b"Chinese"
+            assert "cached" in zh_cached.flags
+            assert mw.process_request(fr_request) is None
 
 
 class DummyPolicyTestMixin(PolicyTestMixin):
@@ -779,6 +1053,55 @@ class RFC2616PolicyTestMixin(PolicyTestMixin):
                 self.assertEqualResponse(res1, res2)
                 assert "cached" in res2.flags
 
+    def test_vary_revalidation_uses_selected_variant_validators(self):
+        # A stale variant is revalidated with its own validators, not with
+        # those of other variants cached under the same URL.
+        url = "http://www.example.com"
+        en_request = Request(url, headers={"Accept-Language": "en"})
+        zh_request = Request(url, headers={"Accept-Language": "zh"})
+        vary = {"Vary": "Accept-Language", "Cache-Control": "max-age=0"}
+        en_response = Response(url, headers={**vary, "ETag": '"en"'}, body=b"English")
+        zh_response = Response(url, headers={**vary, "ETag": '"zh"'}, body=b"Chinese")
+        with self._middleware() as mw:
+            self._process_requestresponse(mw, en_request, en_response)
+            self._process_requestresponse(mw, zh_request, zh_response)
+
+            assert mw.process_request(en_request) is None
+            assert en_request.headers[b"If-None-Match"] == b'"en"'
+            assert mw.process_request(zh_request) is None
+            assert zh_request.headers[b"If-None-Match"] == b'"zh"'
+
+    def test_vary_change_on_revalidation_invalidates_variants(self):
+        # When a revalidation changes the Vary set of the cached response,
+        # variants cached under the old Vary set cannot be matched anymore.
+        url = "http://www.example.com"
+        en_request = Request(url, headers={"Accept-Language": "en"})
+        zh_request = Request(url, headers={"Accept-Language": "zh"})
+        vary = {"Vary": "Accept-Language", "Cache-Control": "max-age=0"}
+        en_response = Response(url, headers={**vary, "ETag": '"en"'}, body=b"English")
+        zh_response = Response(url, headers={**vary, "ETag": '"zh"'}, body=b"Chinese")
+        with self._middleware() as mw:
+            self._process_requestresponse(mw, en_request, en_response)
+            self._process_requestresponse(mw, zh_request, zh_response)
+
+            # The server revalidates the English variant and now selects
+            # responses by a different header.
+            assert mw.process_request(en_request) is None
+            res304 = Response(
+                url, status=304, headers={"Vary": "Accept-Encoding", "ETag": '"en"'}
+            )
+            self._process_requestresponse(mw, en_request, res304)
+
+            # The Chinese variant is gone: the only cached variant left is
+            # the freshened English one, selected by Accept-Encoding.
+            zh_cached = mw.storage.retrieve_response(mw.crawler.spider, zh_request)
+            assert isinstance(zh_cached, Response)
+            assert zh_cached.body == b"English"
+            gzip_request = Request(
+                url, headers={"Accept-Language": "zh", "Accept-Encoding": "gzip"}
+            )
+            assert mw.storage.retrieve_response(mw.crawler.spider, gzip_request) is None
+
 
 # Concrete test classes that combine storage and policy mixins
 
@@ -793,6 +1116,15 @@ class FilesystemStorageTestMixin(StorageTestMixin):
     def _downgrade_cache_entry(self, storage, spider, request) -> None:
         rpath = Path(storage._get_request_path(spider, request))
         (rpath / "response_data").unlink()
+
+    def _corrupt_vary_index(self, storage, spider, request, payload) -> None:
+        rpath = Path(storage._get_request_path(spider, request))
+        with storage._open(rpath / "vary_index", "wb") as f:
+            f.write(payload)
+
+    def _store_legacy_entry(self, storage, spider, request, response) -> None:
+        rpath = Path(storage._get_request_path(spider, request))
+        storage._write_response(rpath, request, response)
 
 
 class DbmStorageTestMixin(StorageTestMixin):
@@ -809,6 +1141,15 @@ class DbmStorageTestMixin(StorageTestMixin):
             k: v for k, v in data.items() if k in ("status", "url", "headers", "body")
         }
         storage.db[f"{key}_data"] = pickle.dumps(data, protocol=4)
+
+    def _corrupt_vary_index(self, storage, spider, request, payload) -> None:
+        key = storage._fingerprinter.fingerprint(request).hex()
+        storage.db[f"{key}_vary"] = payload
+
+    def _store_legacy_entry(self, storage, spider, request, response) -> None:
+        key = storage._fingerprinter.fingerprint(request).hex()
+        storage.db[f"{key}_data"] = pickle.dumps(response.to_dict(), protocol=4)
+        storage.db[f"{key}_time"] = str(time.time())
 
 
 class TestFilesystemStorageWithDummyPolicy(
@@ -868,3 +1209,68 @@ class TestFilesystemStorageGzipWithDummyPolicy(TestFilesystemStorageWithDummyPol
 )
 def test_rfc1123_to_epoch(string: str | None, expected: int | None) -> None:
     assert rfc1123_to_epoch(string) == expected
+
+
+class VarySpider(Spider):
+    name = "vary-spider"
+
+    def __init__(self, url: str, *args: Any, **kwargs: Any):
+        super().__init__(*args, **kwargs)
+        self.url = url
+        self.bodies: dict[str, str] = {}
+
+    async def start(self) -> AsyncIterator[Any]:
+        for language in ("en", "zh"):
+            yield Request(
+                self.url,
+                headers={"Accept-Language": language},
+                dont_filter=True,
+                callback=self.parse,
+                cb_kwargs={"language": language},
+            )
+
+    def parse(self, response: Response, language: str) -> None:
+        self.bodies[language] = response.text
+
+
+@pytest.mark.parametrize(
+    "storage_class",
+    [
+        "scrapy.extensions.httpcache.FilesystemCacheStorage",
+        "scrapy.extensions.httpcache.DbmCacheStorage",
+    ],
+)
+@coroutine_test
+async def test_vary_variants_across_crawls(
+    mockserver: MockServer, tmp_path: Path, storage_class: str
+) -> None:
+    """Two crawls sharing a cache directory: the first one stores the
+    English and Chinese variants of the same URL, the second one revalidates
+    each variant with its own ETag and still serves the right bodies."""
+    VaryResource.received.clear()
+    settings = {
+        "HTTPCACHE_ENABLED": True,
+        "HTTPCACHE_DIR": str(tmp_path),
+        "HTTPCACHE_POLICY": "scrapy.extensions.httpcache.RFC2616Policy",
+        "HTTPCACHE_STORAGE": storage_class,
+    }
+    url = mockserver.url("/vary")
+
+    crawler = get_crawler(VarySpider, settings)
+    await crawler.crawl_async(url=url)
+    assert isinstance(crawler.spider, VarySpider)
+    assert crawler.spider.bodies == {"en": "Hello!", "zh": "\u4f60\u597d\uff01"}
+    assert crawler.stats.get_value("httpcache/store") == 2
+    assert [r[b"if-none-match"] for r in VaryResource.received] == [None, None]
+
+    # A new crawler over the same cache directory revalidates each variant
+    # with the ETag of that variant and still serves the right bodies.
+    crawler = get_crawler(VarySpider, settings)
+    await crawler.crawl_async(url=url)
+    assert isinstance(crawler.spider, VarySpider)
+    assert crawler.spider.bodies == {"en": "Hello!", "zh": "\u4f60\u597d\uff01"}
+    assert crawler.stats.get_value("httpcache/revalidate") == 2
+    revalidations = {
+        r[b"accept-language"]: r[b"if-none-match"] for r in VaryResource.received[2:]
+    }
+    assert revalidations == {b"en": b'"en-v1"', b"zh": b'"zh-v1"'}

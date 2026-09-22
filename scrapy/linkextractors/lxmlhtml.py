@@ -17,7 +17,7 @@ from parsel.csstranslator import HTMLTranslator
 from w3lib.html import strip_html5_whitespace
 from w3lib.url import canonicalize_url, safe_url_string
 
-from scrapy.link import Link
+from scrapy.link import Link, SrcsetCandidate
 from scrapy.linkextractors import IGNORED_EXTENSIONS, _is_valid_url, _matches
 from scrapy.utils.misc import arg_to_iter, rel_has_nofollow
 from scrapy.utils.python import unique as unique_list
@@ -37,6 +37,103 @@ logger = logging.getLogger(__name__)
 XHTML_NAMESPACE = "http://www.w3.org/1999/xhtml"
 
 _collect_string_content = etree.XPath("string()")
+
+# Attributes whose value is a list of image candidate URLs, parsed with
+# _parse_srcset() instead of being taken as a single URL.
+_SRCSET_ATTRIBUTES = frozenset({"imagesrcset", "srcset"})
+
+# https://infra.spec.whatwg.org/#ascii-whitespace
+_HTML_WHITESPACE = " \t\n\f\r"
+
+# https://html.spec.whatwg.org/multipage/common-microsyntaxes.html#valid-floating-point-number
+_HTML_FLOAT = re.compile(r"-?(?:[0-9]+(?:\.[0-9]+)?|\.[0-9]+)(?:[eE][+-]?[0-9]+)?\Z")
+
+
+def _is_ascii_digits(value: str) -> bool:
+    return value.isascii() and value.isdigit()
+
+
+def _valid_srcset_descriptors(descriptors: list[str]) -> bool:
+    """Return whether *descriptors* are valid for a srcset candidate.
+
+    Every descriptor must be a width (``100w``), height (``100h``) or pixel
+    density (``1.5x``) descriptor, no kind may appear twice, width and
+    density cannot be combined, and height requires width.
+    """
+    width = height = density = False
+    for descriptor in descriptors:
+        number, kind = descriptor[:-1], descriptor[-1:]
+        if kind == "w":
+            if width or density or not _is_ascii_digits(number) or int(number) == 0:
+                return False
+            width = True
+        elif kind == "h":
+            if height or not _is_ascii_digits(number):
+                return False
+            height = True
+        elif kind == "x":
+            if (
+                density
+                or width
+                or not _HTML_FLOAT.fullmatch(number)
+                or float(number) <= 0
+            ):
+                return False
+            density = True
+        else:
+            return False
+    return not height or width
+
+
+def _parse_srcset(value: str) -> list[tuple[str, tuple[str, ...]]]:
+    """Split a srcset attribute value into ``(url, descriptors)`` candidates.
+
+    Follows the "parse a srcset attribute" algorithm of the HTML standard
+    (https://html.spec.whatwg.org/multipage/images.html#parse-a-srcset-attribute):
+    commas inside a URL, e.g. in a data URL, do not split candidates, and a
+    candidate with invalid descriptors is dropped without affecting the
+    remaining candidates.
+    """
+    candidates: list[tuple[str, tuple[str, ...]]] = []
+    position = 0
+    end = len(value)
+    while True:
+        # Skip whitespace and commas between candidates.
+        while position < end and value[position] in _HTML_WHITESPACE + ",":
+            position += 1
+        if position == end:
+            return candidates
+        start = position
+        # The URL runs up to the next whitespace, so it keeps its commas.
+        while position < end and value[position] not in _HTML_WHITESPACE:
+            position += 1
+        url = value[start:position]
+        descriptors: list[str] = []
+        if url.endswith(","):
+            # Trailing commas are candidate separators, not part of the URL.
+            url = url.rstrip(",")
+            if not url:  # pragma: no cover
+                continue
+        else:
+            # Collect descriptors until a comma (consumed) or the end of the
+            # attribute value.
+            while True:
+                while position < end and value[position] in _HTML_WHITESPACE:
+                    position += 1
+                if position == end:
+                    break
+                if value[position] == ",":
+                    position += 1
+                    break
+                start = position
+                while (
+                    position < end
+                    and value[position] not in _HTML_WHITESPACE + ","
+                ):
+                    position += 1
+                descriptors.append(value[start:position])
+        if _valid_srcset_descriptors(descriptors):
+            candidates.append((url, tuple(descriptors)))
 
 
 def _nons(tag: Any) -> Any:
@@ -103,7 +200,7 @@ class LxmlParserLinkExtractor:
 
     def _iter_links(
         self, document: HtmlElement
-    ) -> Iterable[tuple[HtmlElement, str, str]]:
+    ) -> Iterable[tuple[HtmlElement, str, str, SrcsetCandidate | None]]:
         for el in document.iter(etree.Element):
             if not self.scan_tag(_nons(el.tag)):
                 continue
@@ -111,7 +208,14 @@ class LxmlParserLinkExtractor:
             for attrib in attribs:
                 if not self.scan_attr(attrib):
                     continue
-                yield el, attrib, attribs[attrib]
+                if attrib in _SRCSET_ATTRIBUTES:
+                    for position, (url, descriptors) in enumerate(
+                        _parse_srcset(attribs[attrib])
+                    ):
+                        candidate = SrcsetCandidate(el, position, descriptors)
+                        yield el, attrib, url, candidate
+                else:
+                    yield el, attrib, attribs[attrib], None
 
     def _extract_links(
         self,
@@ -122,7 +226,7 @@ class LxmlParserLinkExtractor:
     ) -> list[Link]:
         links: list[Link] = []
         # hacky way to get the underlying lxml parsed document
-        for el, _, attr_val in self._iter_links(selector.root):
+        for el, _, attr_val, srcset in self._iter_links(selector.root):
             # pseudo lxml.html.HtmlElement.make_links_absolute(base_url)
             try:
                 if self.strip:
@@ -146,6 +250,7 @@ class LxmlParserLinkExtractor:
                 url,
                 _collect_string_content(el) or "",
                 nofollow=rel_has_nofollow(el.get("rel")),
+                srcset=srcset,
             )
             links.append(link)
         return self._deduplicate_if_needed(links)
@@ -227,6 +332,10 @@ class LxmlLinkExtractor:
         when looking for links to extract (only for those tags specified in the
         ``tags`` parameter). Defaults to ``('href',)``. Use ``'*'`` to consider
         every attribute.
+
+        .. versionchanged:: VERSION
+            The ``srcset`` and ``imagesrcset`` attributes are parsed into one
+            link per candidate; see :ref:`srcset`.
     :type attrs: list
 
     :param deny_tags: a tag or a list of tags that should not be considered when

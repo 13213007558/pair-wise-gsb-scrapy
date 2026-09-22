@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 import pytest
+from lxml.html import fromstring
 
-from scrapy.link import Link
+from scrapy.link import Link, SrcsetCandidate
 
 
 def _assert_same_links(link1: Link, link2: Link) -> None:
@@ -63,3 +64,15 @@ def test_bytes_url() -> None:
 def test_eq_non_link() -> None:
     url = "http://example.com"
     assert Link(url) != url
+
+
+def test_srcset() -> None:
+    assert Link("http://example.com").srcset is None
+
+    element = fromstring('<img srcset="a.jpg 1x, b.jpg 2x">')
+    candidate = SrcsetCandidate(element=element, position=1, descriptors=("2x",))
+    link = Link("http://example.com/b.jpg", srcset=candidate)
+    assert link.srcset == candidate
+    assert link.srcset.element is element
+    assert link.srcset.position == 1
+    assert link.srcset.descriptors == ("2x",)

@@ -2,15 +2,22 @@ from __future__ import annotations
 
 import pickle
 import re
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
+import pytest
 from w3lib.url import canonicalize_url
 
-from scrapy.http import HtmlResponse, TextResponse, XmlResponse
+from scrapy import Spider
+from scrapy.http import HtmlResponse, Request, TextResponse, XmlResponse
 from scrapy.link import Link
 from scrapy.linkextractors import lxmlhtml
 from scrapy.linkextractors.lxmlhtml import LxmlLinkExtractor, LxmlParserLinkExtractor
+from scrapy.utils.test import get_crawler
 from tests import get_testdata
+from tests.utils.decorators import coroutine_test
+
+if TYPE_CHECKING:
+    from tests.mockserver.http import MockServer
 
 
 class TestLxmlLinkExtractor:
@@ -922,3 +929,267 @@ class TestLxmlParserLinkExtractor:
             strip=False, process=reject_trailing_whitespace
         )
         assert lx_no_strip.extract_links(response) == []
+
+
+def _extract_srcset_links(html: bytes, **kwargs: Any) -> list[Link]:
+    response = HtmlResponse("http://example.com/index", body=html)
+    lx = LxmlLinkExtractor(
+        tags=["img", "source", "link"],
+        attrs=["srcset", "imagesrcset"],
+        deny_extensions=[],
+        **kwargs,
+    )
+    return lx.extract_links(response)
+
+
+class TestLxmlLinkExtractorSrcset:
+    def test_candidates_keep_order_descriptors_and_element(self):
+        html = b'<img srcset="small.jpg 480w, large.jpg 2x">'
+        links = _extract_srcset_links(html)
+        assert [(link.url, link.descriptor, link.position) for link in links] == [
+            ("http://example.com/small.jpg", "480w", 0),
+            ("http://example.com/large.jpg", "2x", 1),
+        ]
+        assert all(link.element is not None for link in links)
+        tags = [link.element.tag for link in links if link.element is not None]
+        assert tags == ["img", "img"]
+
+    def test_whitespace_and_commas(self):
+        html = b'<img srcset=" ,\n a.jpg 1x ,\t b.jpg 2x, ,">'
+        links = _extract_srcset_links(html)
+        assert [(link.url, link.descriptor) for link in links] == [
+            ("http://example.com/a.jpg", "1x"),
+            ("http://example.com/b.jpg", "2x"),
+        ]
+
+    def test_comma_right_after_url(self):
+        html = b'<img srcset="a.jpg, b.jpg">'
+        links = _extract_srcset_links(html)
+        assert [(link.url, link.descriptor) for link in links] == [
+            ("http://example.com/a.jpg", ""),
+            ("http://example.com/b.jpg", ""),
+        ]
+
+    def test_data_url_commas_do_not_split(self):
+        html = b'<img srcset="data:image/png;base64,iVBORw0KG,go= 1x, b.jpg 2x">'
+        response = HtmlResponse("http://example.com/index", body=html)
+        lx = LxmlParserLinkExtractor(tag="img", attr="srcset")
+        assert [link.url for link in lx.extract_links(response)] == [
+            "data:image/png;base64,iVBORw0KG,go=",
+            "http://example.com/b.jpg",
+        ]
+        # LxmlLinkExtractor drops the data: URL as an unsupported scheme,
+        # and no bogus URL is built from the base64 payload.
+        links = _extract_srcset_links(html)
+        assert [link.url for link in links] == ["http://example.com/b.jpg"]
+
+    @pytest.mark.parametrize(
+        "descriptor",
+        [
+            "2y",
+            "0w",
+            "100w 2x",
+            "2x 100w",
+            "100h",
+            "100h 200h",
+            "2x 100h",
+            "1x 2x",
+            "1.5.2x",
+            "foo",
+            "100ww",
+            "(1x)",
+        ],
+    )
+    def test_invalid_descriptor_drops_only_that_candidate(self, descriptor):
+        html = f'<img srcset="a.jpg {descriptor}, b.jpg 2x">'.encode()
+        links = _extract_srcset_links(html)
+        assert [(link.url, link.descriptor) for link in links] == [
+            ("http://example.com/b.jpg", "2x"),
+        ]
+
+    @pytest.mark.parametrize(
+        "descriptor", ["", "100w", "2x", "1.5x", "1.5e1x", "100w 100h"]
+    )
+    def test_valid_descriptors(self, descriptor):
+        html = f'<img srcset="a.jpg {descriptor}">'.encode()
+        links = _extract_srcset_links(html)
+        assert [(link.url, link.descriptor) for link in links] == [
+            ("http://example.com/a.jpg", descriptor),
+        ]
+
+    def test_imagesrcset(self):
+        html = (
+            b'<link rel="preload" as="image"'
+            b' imagesrcset="hero-800.jpg 800w, hero-1600.jpg 1600w">'
+        )
+        links = _extract_srcset_links(html)
+        assert [(link.url, link.descriptor, link.position) for link in links] == [
+            ("http://example.com/hero-800.jpg", "800w", 0),
+            ("http://example.com/hero-1600.jpg", "1600w", 1),
+        ]
+        tags = [link.element.tag for link in links if link.element is not None]
+        assert tags == ["link", "link"]
+
+    def test_picture_source(self):
+        html = (
+            b"<picture>"
+            b'<source srcset="a.webp 1x, a@2x.webp 2x">'
+            b'<img src="a.jpg">'
+            b"</picture>"
+        )
+        links = _extract_srcset_links(html)
+        assert [(link.url, link.descriptor) for link in links] == [
+            ("http://example.com/a.webp", "1x"),
+            ("http://example.com/a@2x.webp", "2x"),
+        ]
+        tags = [link.element.tag for link in links if link.element is not None]
+        assert tags == ["source", "source"]
+
+    def test_entities(self):
+        html = b'<img srcset="a.jpg?x=1&amp;y=2 1x, b.jpg 2x">'
+        links = _extract_srcset_links(html)
+        assert [link.url for link in links] == [
+            "http://example.com/a.jpg?x=1&y=2",
+            "http://example.com/b.jpg",
+        ]
+
+    def test_non_utf8_page(self):
+        html = '<img srcset="\u56fe\u7247.jpg 1x, b.jpg 2x">'.encode("gb18030")
+        response = HtmlResponse(
+            "http://example.com/index", body=html, encoding="gb18030"
+        )
+        lx = LxmlLinkExtractor(tags=["img"], attrs=["srcset"], deny_extensions=[])
+        links = lx.extract_links(response)
+        assert [link.url for link in links] == [
+            "http://example.com/%E5%9B%BE%E7%89%87.jpg",
+            "http://example.com/b.jpg",
+        ]
+
+    def test_base_url(self):
+        html = (
+            b'<base href="http://cdn.example.com/media/">'
+            b'<img srcset="a.jpg 1x, b.jpg 2x">'
+        )
+        links = _extract_srcset_links(html)
+        assert [link.url for link in links] == [
+            "http://cdn.example.com/media/a.jpg",
+            "http://cdn.example.com/media/b.jpg",
+        ]
+
+    def test_process_value(self):
+        html = b'<img srcset="a.jpg 1x, b.jpg 2x">'
+        links = _extract_srcset_links(
+            html, process_value=lambda value: value + "?from=srcset"
+        )
+        assert [link.url for link in links] == [
+            "http://example.com/a.jpg?from=srcset",
+            "http://example.com/b.jpg?from=srcset",
+        ]
+        links = _extract_srcset_links(
+            html, process_value=lambda value: None if "a.jpg" in value else value
+        )
+        assert [link.url for link in links] == ["http://example.com/b.jpg"]
+
+    def test_allow_deny(self):
+        html = b'<img srcset="a.jpg 1x, b.jpg 2x, c.png 1x">'
+        links = _extract_srcset_links(html, allow=(r"a\.jpg", r"c\.png"))
+        assert [link.url for link in links] == [
+            "http://example.com/a.jpg",
+            "http://example.com/c.png",
+        ]
+        links = _extract_srcset_links(html, deny=(r"b\.jpg",))
+        assert [link.url for link in links] == [
+            "http://example.com/a.jpg",
+            "http://example.com/c.png",
+        ]
+
+    def test_deny_domains(self):
+        html = b'<img srcset="http://cdn.example.com/a.jpg 1x, /b.jpg 2x">'
+        links = _extract_srcset_links(html, deny_domains=("cdn.example.com",))
+        assert [link.url for link in links] == ["http://example.com/b.jpg"]
+
+    def test_deny_extensions_default(self):
+        html = b'<img srcset="a.jpg 1x, b.html 2x">'
+        response = HtmlResponse("http://example.com/index", body=html)
+        lx = LxmlLinkExtractor(tags=["img"], attrs=["srcset"])
+        assert [link.url for link in lx.extract_links(response)] == [
+            "http://example.com/b.html",
+        ]
+
+    def test_restrict_xpaths(self):
+        html = (
+            b'<div class="gallery"><img srcset="a.jpg 1x"></div>'
+            b'<div><img srcset="b.jpg 1x"></div>'
+        )
+        links = _extract_srcset_links(html, restrict_xpaths="//div[@class='gallery']")
+        assert [link.url for link in links] == ["http://example.com/a.jpg"]
+
+    def test_restrict_css(self):
+        html = (
+            b'<div class="gallery"><img srcset="a.jpg 1x"></div>'
+            b'<div><img srcset="b.jpg 1x"></div>'
+        )
+        links = _extract_srcset_links(html, restrict_css="div.gallery")
+        assert [link.url for link in links] == ["http://example.com/a.jpg"]
+
+    def test_deduplication_keeps_first_candidate(self):
+        html = b'<img srcset="a.jpg 1x, a.jpg 2x, b.jpg 1x">'
+        links = _extract_srcset_links(html)
+        assert [(link.url, link.descriptor, link.position) for link in links] == [
+            ("http://example.com/a.jpg", "1x", 0),
+            ("http://example.com/b.jpg", "1x", 2),
+        ]
+        links = _extract_srcset_links(html, unique=False)
+        assert [(link.url, link.descriptor) for link in links] == [
+            ("http://example.com/a.jpg", "1x"),
+            ("http://example.com/a.jpg", "2x"),
+            ("http://example.com/b.jpg", "1x"),
+        ]
+
+    def test_plain_links_have_no_candidate_data(self):
+        html = b'<a href="page.html">x</a>'
+        response = HtmlResponse("http://example.com/index", body=html)
+        (link,) = LxmlLinkExtractor().extract_links(response)
+        assert link.element is None
+        assert link.descriptor == ""
+        assert link.position == 0
+
+
+class SrcsetSpider(Spider):
+    """Collect image candidates from srcset attributes and request them."""
+
+    name = "srcset"
+
+    def __init__(self, *args: Any, mockserver: MockServer, **kwargs: Any):
+        super().__init__(*args, **kwargs)
+        self.start_urls = [mockserver.url("/static/srcset.html")]
+        self.link_extractor = LxmlLinkExtractor(
+            tags=["img"], attrs=["srcset"], deny_extensions=[]
+        )
+        self.extracted: list[str] = []
+        self.requested: list[str] = []
+
+    def parse(self, response):
+        for link in self.link_extractor.extract_links(response):
+            self.extracted.append(link.url)
+            yield Request(link.url, callback=self.parse_image)
+
+    def parse_image(self, response):
+        self.requested.append(response.url)
+
+
+class TestSrcsetSpider:
+    @coroutine_test
+    async def test_crawl(self, mockserver: MockServer):
+        crawler = get_crawler(SrcsetSpider)
+        await crawler.crawl_async(mockserver=mockserver)
+        assert isinstance(crawler.spider, SrcsetSpider)
+        # Every valid candidate URL is requested, while the commas of the
+        # data: URL in the page do not turn its payload into HTTP requests.
+        expected = [
+            mockserver.url("/static/item1.html"),
+            mockserver.url("/static/item2.html"),
+            mockserver.url("/static/index.html"),
+        ]
+        assert crawler.spider.extracted == expected
+        assert sorted(crawler.spider.requested) == sorted(expected)

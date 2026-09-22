@@ -38,6 +38,98 @@ XHTML_NAMESPACE = "http://www.w3.org/1999/xhtml"
 
 _collect_string_content = etree.XPath("string()")
 
+_HTML5_WHITESPACE = " \t\n\r\f"
+
+# Attributes whose value is a list of image candidate URLs with optional
+# descriptors, parsed according to the HTML standard instead of being treated
+# as a single URL.
+_SRCSET_ATTRIBUTES = frozenset({"imagesrcset", "srcset"})
+
+_INTEGER_RE = re.compile(r"[0-9]+")
+_FLOAT_RE = re.compile(r"-?(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+)(?:[eE][-+]?[0-9]+)?")
+
+
+def _read_srcset_descriptors(value: str, pos: int) -> tuple[str, int]:
+    """Read the descriptors of a srcset candidate starting at *pos*.
+
+    Descriptors run until a comma that is not inside parentheses or until the
+    end of *value*. Return the descriptors and the position right after them.
+    """
+    start = pos
+    depth = 0
+    while pos < len(value):
+        char = value[pos]
+        if not depth and char == ",":
+            break
+        if char == "(":
+            depth += 1
+        elif char == ")" and depth:
+            depth -= 1
+        pos += 1
+    descriptors = value[start:pos]
+    if pos < len(value):
+        pos += 1  # consume the comma
+    return strip_html5_whitespace(descriptors), pos
+
+
+def _valid_srcset_descriptors(descriptors: str) -> bool:
+    """Return whether *descriptors* is a valid srcset descriptor list.
+
+    A candidate may carry a width descriptor (``600w``), a pixel density
+    descriptor (``2x``) or, for future compatibility, a height descriptor
+    (``100h``, only valid next to a width one). Anything else, including
+    combining width or height with density, is invalid.
+    """
+    width = height = density = False
+    for descriptor in descriptors.split():
+        value = descriptor[:-1]
+        if descriptor.endswith("w") and _INTEGER_RE.fullmatch(value):
+            if width or density or not int(value):
+                return False
+            width = True
+        elif descriptor.endswith("h") and _INTEGER_RE.fullmatch(value):
+            if height or density:
+                return False
+            height = True
+        elif descriptor.endswith("x") and _FLOAT_RE.fullmatch(value):
+            if width or height or density:
+                return False
+            density = True
+        else:
+            return False
+    return not height or width
+
+
+def _parse_srcset(value: str) -> list[tuple[str, str]]:
+    """Parse a *srcset* or *imagesrcset* attribute value.
+
+    Return ``(url, descriptors)`` tuples in document order, following the
+    HTML standard parsing algorithm: commas only separate candidates when
+    they are not part of a URL (e.g. commas inside data URLs do not split
+    candidates), and candidates with invalid descriptors are dropped without
+    affecting the remaining candidates.
+    """
+    candidates: list[tuple[str, str]] = []
+    pos = 0
+    end = len(value)
+    while True:
+        while pos < end and (value[pos] in _HTML5_WHITESPACE or value[pos] == ","):
+            pos += 1
+        if pos == end:
+            return candidates
+        start = pos
+        while pos < end and value[pos] not in _HTML5_WHITESPACE:
+            pos += 1
+        url = value[start:pos]
+        if url.endswith(","):
+            # Commas trailing a URL are separators, not descriptors.
+            url = url.rstrip(",")
+            descriptors = ""
+        else:
+            descriptors, pos = _read_srcset_descriptors(value, pos)
+        if _valid_srcset_descriptors(descriptors):
+            candidates.append((url, descriptors))
+
 
 def _nons(tag: Any) -> Any:
     if (
@@ -103,7 +195,7 @@ class LxmlParserLinkExtractor:
 
     def _iter_links(
         self, document: HtmlElement
-    ) -> Iterable[tuple[HtmlElement, str, str]]:
+    ) -> Iterable[tuple[HtmlElement, str, str | None, int]]:
         for el in document.iter(etree.Element):
             if not self.scan_tag(_nons(el.tag)):
                 continue
@@ -111,7 +203,13 @@ class LxmlParserLinkExtractor:
             for attrib in attribs:
                 if not self.scan_attr(attrib):
                     continue
-                yield el, attrib, attribs[attrib]
+                if attrib in _SRCSET_ATTRIBUTES:
+                    for position, (url, descriptor) in enumerate(
+                        _parse_srcset(attribs[attrib])
+                    ):
+                        yield el, url, descriptor, position
+                else:
+                    yield el, attribs[attrib], None, 0
 
     def _extract_links(
         self,
@@ -122,7 +220,7 @@ class LxmlParserLinkExtractor:
     ) -> list[Link]:
         links: list[Link] = []
         # hacky way to get the underlying lxml parsed document
-        for el, _, attr_val in self._iter_links(selector.root):
+        for el, attr_val, descriptor, position in self._iter_links(selector.root):
             # pseudo lxml.html.HtmlElement.make_links_absolute(base_url)
             try:
                 if self.strip:
@@ -142,11 +240,21 @@ class LxmlParserLinkExtractor:
 
             # to fix relative links after process_value
             url = urljoin(response_url, url)
-            link = Link(
-                url,
-                _collect_string_content(el) or "",
-                nofollow=rel_has_nofollow(el.get("rel")),
-            )
+            if descriptor is None:
+                link = Link(
+                    url,
+                    _collect_string_content(el) or "",
+                    nofollow=rel_has_nofollow(el.get("rel")),
+                )
+            else:
+                link = Link(
+                    url,
+                    _collect_string_content(el) or "",
+                    nofollow=rel_has_nofollow(el.get("rel")),
+                    element=el,
+                    descriptor=descriptor,
+                    position=position,
+                )
             links.append(link)
         return self._deduplicate_if_needed(links)
 
@@ -227,6 +335,14 @@ class LxmlLinkExtractor:
         when looking for links to extract (only for those tags specified in the
         ``tags`` parameter). Defaults to ``('href',)``. Use ``'*'`` to consider
         every attribute.
+
+        The ``srcset`` and ``imagesrcset`` attributes are not treated as
+        single URLs: their value is parsed into image candidate URLs
+        following the HTML standard, and every valid candidate is extracted
+        as a separate link whose ``element``, ``descriptor`` and ``position``
+        attributes identify the candidate it comes from. When the same URL
+        is extracted from several candidates, deduplication keeps the first
+        candidate, including its candidate attributes.
     :type attrs: list
 
     :param deny_tags: a tag or a list of tags that should not be considered when

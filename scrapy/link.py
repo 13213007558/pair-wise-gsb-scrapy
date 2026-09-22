@@ -5,6 +5,13 @@ For actual link extractors implementation see scrapy.linkextractors, or
 its documentation in: docs/topics/link-extractors.rst
 """
 
+from __future__ import annotations
+
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from lxml.html import HtmlElement
+
 
 class Link:
     """Link objects represent an extracted link by the LinkExtractor.
@@ -24,12 +31,50 @@ class Link:
 
     :param nofollow: an indication of the presence or absence of a nofollow value in the ``rel`` attribute
                     of the anchor tag.
+
+    :param element: the element that the link was extracted from. It is only
+        set for links extracted from a ``srcset`` or ``imagesrcset``
+        attribute, it is ``None`` for other links.
+
+        .. versionadded:: VERSION
+
+    :param descriptor: the descriptor of the ``srcset`` or ``imagesrcset``
+        candidate that the link was extracted from, e.g. ``"2x"`` or
+        ``"600w"``. It is an empty string for links extracted from other
+        attributes and for candidates without a descriptor.
+
+        .. versionadded:: VERSION
+
+    :param position: the 0-based position of the candidate within its
+        ``srcset`` or ``imagesrcset`` attribute. It is 0 for links extracted
+        from other attributes.
+
+        .. versionadded:: VERSION
+
+    The *element*, *descriptor* and *position* attributes are not taken into
+    account for equality comparison or hashing.
     """
 
-    __slots__ = ["fragment", "nofollow", "text", "url"]
+    __slots__ = [
+        "descriptor",
+        "element",
+        "fragment",
+        "nofollow",
+        "position",
+        "text",
+        "url",
+    ]
 
     def __init__(
-        self, url: str, text: str = "", fragment: str = "", nofollow: bool = False
+        self,
+        url: str,
+        text: str = "",
+        fragment: str = "",
+        nofollow: bool = False,
+        *,
+        element: HtmlElement | None = None,
+        descriptor: str = "",
+        position: int = 0,
     ):
         if not isinstance(url, str):
             got = url.__class__.__name__
@@ -38,6 +83,9 @@ class Link:
         self.text: str = text
         self.fragment: str = fragment
         self.nofollow: bool = nofollow
+        self.element: HtmlElement | None = element
+        self.descriptor: str = descriptor
+        self.position: int = position
 
     def __eq__(self, other: object) -> bool:
         if not isinstance(other, Link):

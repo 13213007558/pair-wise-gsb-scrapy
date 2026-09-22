@@ -37,6 +37,11 @@ class DepthMiddleware(BaseSpiderMiddleware):
     :setting:`DEPTH_LIMIT`, :setting:`DEPTH_STATS_VERBOSE` and
     :setting:`DEPTH_PRIORITY` settings.
 
+    When :setting:`DUPEFILTER_SHORTEST_DEPTH` is enabled, the duplicate
+    filter can allow a request to be scheduled again if it is found at a
+    strictly lower depth, so that its callback can yield requests based on
+    that lower depth.
+
     .. reqmeta:: depth_reset
 
     depth_reset

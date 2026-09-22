@@ -85,6 +85,176 @@ class TestRFPDupeFilter:
 
         dupefilter.close("finished")
 
+    @pytest.mark.parametrize(
+        ("first_depth", "second_depth", "second_seen"),
+        [(2, 2, True), (2, 3, True), (2, 1, False), (1, 0, False)],
+    )
+    def test_shortest_depth(
+        self, first_depth: int, second_depth: int, second_seen: bool
+    ) -> None:
+        dupefilter = cast(
+            RFPDupeFilter,
+            _get_dupefilter(settings={"DUPEFILTER_SHORTEST_DEPTH": True}),
+        )
+        request = Request("https://example.com")
+
+        request.meta["depth"] = first_depth
+        assert not dupefilter.request_seen(request)
+
+        request.meta["depth"] = second_depth
+        assert dupefilter.request_seen(request) is second_seen
+
+        dupefilter.close("finished")
+
+    def test_shortest_depth_missing_depth(self) -> None:
+        dupefilter = cast(
+            RFPDupeFilter,
+            _get_dupefilter(settings={"DUPEFILTER_SHORTEST_DEPTH": True}),
+        )
+
+        assert not dupefilter.request_seen(
+            Request("https://example.com", meta={"depth": 1})
+        )
+        assert not dupefilter.request_seen(Request("https://example.com"))
+        assert dupefilter.request_seen(Request("https://example.com"))
+
+        dupefilter.close("finished")
+
+    def test_shortest_depth_dont_filter_does_not_update_depth(self) -> None:
+        crawler = get_crawler(
+            SimpleSpider,
+            {
+                "DUPEFILTER_SHORTEST_DEPTH": True,
+                "SCHEDULER_PRIORITY_QUEUE": "scrapy.pqueues.ScrapyPriorityQueue",
+            },
+        )
+        scheduler = build_from_crawler(Scheduler, crawler)
+        spider = SimpleSpider.from_crawler(crawler)
+        scheduler.open(spider)
+        request = Request("https://example.com", meta={"depth": 1})
+
+        assert scheduler.enqueue_request(request)
+        request.dont_filter = True
+        request.meta["depth"] = 0
+        assert scheduler.enqueue_request(request)
+        request.dont_filter = False
+        assert scheduler.enqueue_request(request)
+
+        scheduler.close("finished")
+
+    def test_shortest_depth_persistence(self, tmp_path: Path) -> None:
+        request = Request("https://example.com")
+        df = cast(
+            RFPDupeFilter,
+            _get_dupefilter(
+                settings={
+                    "DUPEFILTER_SHORTEST_DEPTH": True,
+                    "JOBDIR": str(tmp_path),
+                },
+                open_=False,
+            ),
+        )
+        df.open()
+        request.meta["depth"] = 2
+        assert not df.request_seen(request)
+        df.close("finished")
+
+        df2 = cast(
+            RFPDupeFilter,
+            _get_dupefilter(
+                settings={
+                    "DUPEFILTER_SHORTEST_DEPTH": True,
+                    "JOBDIR": str(tmp_path),
+                },
+                open_=False,
+            ),
+        )
+        df2.open()
+        assert df2.request_seen(
+            Request("https://example.com", meta={"depth": 2})
+        )
+        assert not df2.request_seen(
+            Request("https://example.com", meta={"depth": 1})
+        )
+        df2.close("finished")
+
+    def test_shortest_depth_rejects_legacy_job_dir(self, tmp_path: Path) -> None:
+        legacy_df = _get_dupefilter(
+            settings={"JOBDIR": str(tmp_path)},
+            open_=False,
+        )
+        legacy_df.open()
+        legacy_df.request_seen(Request("https://example.com"))
+        legacy_df.close("finished")
+
+        with pytest.raises(ValueError, match="created without it"):
+            _get_dupefilter(
+                settings={
+                    "DUPEFILTER_SHORTEST_DEPTH": True,
+                    "JOBDIR": str(tmp_path),
+                },
+                open_=False,
+            )
+
+    def test_default_dupefilter_rejects_shortest_depth_job_dir(
+        self, tmp_path: Path
+    ) -> None:
+        depth_df = cast(
+            RFPDupeFilter,
+            _get_dupefilter(
+                settings={
+                    "DUPEFILTER_SHORTEST_DEPTH": True,
+                    "JOBDIR": str(tmp_path),
+                },
+                open_=False,
+            ),
+        )
+        depth_df.open()
+        depth_df.close("finished")
+
+        with pytest.raises(ValueError, match="created with"):
+            _get_dupefilter(
+                settings={"JOBDIR": str(tmp_path)},
+                open_=False,
+            )
+
+    def test_shortest_depth_rejects_unknown_format(self, tmp_path: Path) -> None:
+        (tmp_path / "requests.depth.seen").write_bytes(b"unsupported")
+
+        with pytest.raises(ValueError, match="Unsupported request depth file"):
+            _get_dupefilter(
+                settings={
+                    "DUPEFILTER_SHORTEST_DEPTH": True,
+                    "JOBDIR": str(tmp_path),
+                },
+                open_=False,
+            )
+
+    def test_shortest_depth_rejects_truncated_format(self, tmp_path: Path) -> None:
+        depth_df = cast(
+            RFPDupeFilter,
+            _get_dupefilter(
+                settings={
+                    "DUPEFILTER_SHORTEST_DEPTH": True,
+                    "JOBDIR": str(tmp_path),
+                },
+                open_=False,
+            ),
+        )
+        depth_df.open()
+        depth_df.close("finished")
+        depth_file = tmp_path / "requests.depth.seen"
+        depth_file.write_bytes(depth_file.read_bytes() + b"\x00")
+
+        with pytest.raises(ValueError, match="Truncated request depth file"):
+            _get_dupefilter(
+                settings={
+                    "DUPEFILTER_SHORTEST_DEPTH": True,
+                    "JOBDIR": str(tmp_path),
+                },
+                open_=False,
+            )
+
     def test_dupefilter_path(self):
         r1 = Request("http://scrapytest.org/1")
         r2 = Request("http://scrapytest.org/2")

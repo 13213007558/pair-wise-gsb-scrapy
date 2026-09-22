@@ -211,6 +211,30 @@ class Delay(LeafResource):
         request.finish()
 
 
+class DepthGraph(BaseResource):
+    """Serve the deterministic graph used by depth dupefilter tests."""
+
+    _LINKS: ClassVar[dict[bytes, tuple[bytes, ...]]] = {
+        b"gateway-a": (b"a",),
+        b"gateway-b": (b"b",),
+        b"home": (b"x?a=1&b=2", b"x?b=2&a=1"),
+        b"a": (b"x?b=2&a=1",),
+        b"b": (b"x?b=2&a=1",),
+        b"x": (b"y", b"ring"),
+        b"ring": (b"x", b"leaf"),
+    }
+
+    def render(self, request: Request) -> bytes:
+        assert request.postpath is not None
+        page = request.postpath[-1]
+        request.setHeader(b"Content-Type", b"text/html; charset=utf-8")
+        links = "".join(
+            f'<a href="/depth-graph/{link.decode("ascii")}"></a>'
+            for link in self._LINKS.get(page, ())
+        )
+        return to_bytes(f"<html><body>{links}</body></html>")
+
+
 class Status(LeafResource):
     def render_GET(self, request: Request) -> bytes:
         n = getarg(request, b"n", 200, type_=int)

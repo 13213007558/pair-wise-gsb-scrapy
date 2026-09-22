@@ -81,6 +81,7 @@ __all__ = [
     "DOWNLOAD_WARNSIZE",
     "DUPEFILTER_CLASS",
     "DUPEFILTER_DEBUG",
+    "DUPEFILTER_SHORTEST_DEPTH",
     "EDITOR",
     "EXTENSIONS",
     "EXTENSIONS_BASE",
@@ -348,6 +349,7 @@ DOWNLOADER_STATS = True
 
 DUPEFILTER_CLASS = "scrapy.dupefilters.RFPDupeFilter"
 DUPEFILTER_DEBUG = False
+DUPEFILTER_SHORTEST_DEPTH = False
 
 EDITOR = "vi"
 if sys.platform == "win32":

@@ -192,7 +192,8 @@ Where:
     the ``info.json`` and ``q{00000}`` files.
 
 -   :class:`~scrapy.dupefilters.RFPDupeFilter` creates the ``requests.seen``
-    file.
+    file, or the ``requests.depth.seen`` file when
+    :setting:`DUPEFILTER_SHORTEST_DEPTH` is enabled.
 
 -   :class:`~scrapy.extensions.spiderstate.SpiderState` creates the
     ``spider.state`` file.

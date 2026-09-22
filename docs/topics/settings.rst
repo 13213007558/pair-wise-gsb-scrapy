@@ -702,6 +702,11 @@ Scope: ``scrapy.spidermiddlewares.depth.DepthMiddleware``
 The maximum depth that will be allowed to crawl for any site. If zero, no limit
 will be imposed.
 
+When a page is first reached through a deeper path, requests to pages linked
+from it can exceed this limit before a shorter path to that page is found.
+See :setting:`DUPEFILTER_SHORTEST_DEPTH` for a way to revisit a page when a
+strictly shallower path is found.
+
 .. setting:: DEPTH_PRIORITY
 
 DEPTH_PRIORITY
@@ -1380,6 +1385,42 @@ Default: ``False``
 
 By default, ``RFPDupeFilter`` only logs the first duplicate request.
 Setting :setting:`DUPEFILTER_DEBUG` to ``True`` will make it log all duplicate requests.
+
+.. setting:: DUPEFILTER_SHORTEST_DEPTH
+
+DUPEFILTER_SHORTEST_DEPTH
+-------------------------
+
+.. versionadded:: VERSION
+
+Default: ``False``
+
+Scope: ``scrapy.dupefilters.RFPDupeFilter``
+
+Whether to track the shortest depth at which each request fingerprint has
+been seen. When enabled, a request is filtered out if its
+:reqmeta:`depth <depth>` is greater than or equal to the shortest depth
+recorded for its fingerprint. A request with a strictly lower depth is
+scheduled again, and its callback can yield requests at that lower depth.
+Requests without a depth, such as start requests, use depth 0.
+
+Requests with :attr:`~scrapy.Request.dont_filter` set to ``True`` bypass the
+duplicate filter as usual and do not update the recorded shortest depths.
+Requests created by
+:class:`~scrapy.downloadermiddlewares.retry.RetryMiddleware` also bypass the
+duplicate filter. The :reqmeta:`depth_reset` request meta key keeps its usual
+meaning: :class:`~scrapy.spidermiddlewares.depth.DepthMiddleware` assigns
+depth 0 before the duplicate filter compares depths.
+
+A request admitted because of a shorter path is downloaded again, its
+callback runs again, and it can produce duplicate items. This setting does
+not provide exactly-once processing.
+
+When :setting:`JOBDIR` is set, shortest depths are stored in
+:file:`requests.depth.seen`. A job directory created with this setting
+enabled cannot be used with it disabled, and a job directory created with it
+disabled cannot be used with it enabled. Scrapy raises an exception in either
+case; use a new job directory instead.
 
 .. setting:: EDITOR
 

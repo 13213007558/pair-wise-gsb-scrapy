@@ -21,6 +21,7 @@ from .http_resources import (
     Compress,
     ContentLengthHeaderResource,
     Delay,
+    DepthGraph,
     Drop,
     DuplicateHeaderResource,
     Echo,
@@ -58,6 +59,7 @@ class Root(BaseResource):
         put_child(self, b"follow", Follow())
         put_child(self, b"books", Books())
         put_child(self, b"delay", Delay())
+        put_child(self, b"depth-graph", DepthGraph())
         put_child(self, b"partial", Partial())
         put_child(self, b"drop", Drop())
         put_child(self, b"raw", Raw())

@@ -21,10 +21,11 @@ from scrapy.utils.python import is_listlike, to_bytes
 
 if TYPE_CHECKING:
     # typing.Self requires Python 3.11
+    from lxml.etree import _Element
     from lxml.html import (
         FormElement,
+        HtmlElement,
         InputElement,
-        MultipleSelectOptions,
         SelectElement,
         TextareaElement,
     )
@@ -139,10 +140,23 @@ class FormRequest(Request):
             formxpath = HTMLTranslator().css_to_xpath(formcss)
 
         form = _get_form(response, formname, formid, formnumber, formxpath)
-        formdata = _get_inputs(form, formdata, dont_click, clickdata)
-        url = _get_form_url(form, kwargs.pop("url", None))
+        controls = _get_form_controls(form)
+        clicked = None if dont_click else _get_clickable(clickdata, controls)
+        formdata = _get_inputs(controls, formdata, clicked)
 
-        method = kwargs.pop("method", form.method)
+        url = kwargs.pop("url", None)
+        if url is None and clicked is not None:
+            formaction = clicked.get("formaction")
+            if formaction is not None:
+                url = strip_html5_whitespace(formaction)
+        url = _get_form_url(form, url)
+
+        if "method" in kwargs:
+            method = kwargs.pop("method")
+        else:
+            method = clicked.get("formmethod") if clicked is not None else None
+            if method is None:
+                method = form.method
         if method is not None:
             method = method.upper()
             if method not in cls.valid_form_methods:
@@ -214,13 +228,62 @@ def _get_form(
     return cast("FormElement", form)
 
 
+def _get_form_controls(form: FormElement) -> list[HtmlElement]:
+    """Return the controls whose form owner is *form*, in document order.
+
+    The form owner of a control with a *form* attribute is the form with
+    that id, wherever the control is in the document. For other controls
+    it is their ancestor form.
+    """
+    form_id = form.get("id")
+    controls = []
+    # XPath from the tree, not from the form element, so that controls
+    # outside the form are also covered. Broken HTML may place elements
+    # in top-level elements that tree iteration from the root would miss.
+    for el in form.getroottree().xpath("//button|//input|//select|//textarea"):
+        owner = el.get("form")
+        if owner is not None:
+            if form_id is not None and owner == form_id:
+                controls.append(el)
+        elif _is_descendant(el, form):
+            controls.append(el)
+    return controls
+
+
+def _is_descendant(el: _Element, ancestor: _Element) -> bool:
+    parent = el.getparent()
+    while parent is not None:
+        if parent is ancestor:
+            return True
+        parent = parent.getparent()
+    return False
+
+
+def _is_disabled(control: HtmlElement) -> bool:
+    """Return whether the control is disabled and hence never submitted.
+
+    A control is disabled when it or an ancestor fieldset has a *disabled*
+    attribute, unless the control is inside the first legend of that
+    fieldset.
+    """
+    if control.get("disabled") is not None:
+        return True
+    for fieldset in control.iterancestors("fieldset"):
+        if fieldset.get("disabled") is None:
+            continue
+        legend = fieldset.find("legend")
+        if legend is not None and _is_descendant(control, legend):
+            continue
+        return True
+    return False
+
+
 def _get_inputs(
-    form: FormElement,
+    controls: list[HtmlElement],
     formdata: FormdataType,
-    dont_click: bool,
-    clickdata: dict[str, str | int] | None,
+    clicked: HtmlElement | None,
 ) -> list[FormdataKVType]:
-    """Return a list of key-value pairs for the inputs found in the given form."""
+    """Return a list of key-value pairs for the successful controls."""
     try:
         formdata_keys = dict(formdata or ()).keys()
     except (ValueError, TypeError):
@@ -228,75 +291,101 @@ def _get_inputs(
 
     if not formdata:
         formdata = []
-    inputs = form.xpath(
-        "descendant::textarea"
-        "|descendant::select"
-        "|descendant::input[not(@type) or @type["
-        ' not(re:test(., "^(?:submit|image|reset)$", "i"))'
-        " and (../@checked or"
-        '  not(re:test(., "^(?:checkbox|radio)$", "i")))]]',
-        namespaces={"re": "http://exslt.org/regular-expressions"},
-    )
-    values: list[FormdataKVType] = [
-        (k, "" if v is None else v)
-        for k, v in (_value(e) for e in inputs)
-        if k and k not in formdata_keys
-    ]
+    values: list[FormdataKVType] = []
+    for control in controls:
+        if not _is_submittable(control):
+            continue
+        k, v = _value(control)
+        if k and k not in formdata_keys:
+            values.append((k, "" if v is None else v))
 
-    if not dont_click:
-        clickable = _get_clickable(clickdata, form)
-        if clickable and clickable[0] not in formdata and clickable[0] is not None:
-            values.append(clickable)
+    if clicked is not None:
+        name = clicked.get("name")
+        if name is not None and name not in formdata:
+            values.append((name, clicked.get("value") or ""))
 
     formdata_items = formdata.items() if isinstance(formdata, Mapping) else formdata
     values.extend((k, v) for k, v in formdata_items if v is not None)
     return values
 
 
+def _is_submittable(control: HtmlElement) -> bool:
+    """Return whether the control contributes its value to the form data.
+
+    Buttons only contribute a value as the clicked submitter, and disabled
+    controls, submit-like inputs and unchecked checkboxes and radio
+    buttons never contribute one.
+    """
+    if control.tag == "button" or _is_disabled(control):
+        return False
+    if control.tag != "input":
+        return True
+    input_type = control.get("type")
+    if input_type is None:
+        return True
+    input_type = input_type.lower()
+    if input_type in ("submit", "image", "reset"):
+        return False
+    return input_type not in ("checkbox", "radio") or control.get("checked") is not None
+
+
 def _value(
-    ele: InputElement | SelectElement | TextareaElement,
-) -> tuple[str | None, str | MultipleSelectOptions | None]:
-    n = ele.name
-    v = ele.value
+    ele: HtmlElement,
+) -> tuple[str | None, str | list[str] | None]:
     if ele.tag == "select":
-        return _select_value(cast("SelectElement", ele), n, v)
-    return n, v
+        select = cast("SelectElement", ele)
+        return select.name, _select_values(select)
+    control = cast("InputElement | TextareaElement", ele)
+    return control.name, control.value
 
 
-def _select_value(
-    ele: SelectElement, n: str | None, v: str | MultipleSelectOptions | None
-) -> tuple[str | None, str | MultipleSelectOptions | None]:
-    multiple = ele.multiple
-    if v is None and not multiple:
-        # Match browser behaviour on simple select tag without options selected
-        # And for select tags without options
-        o = ele.value_options
-        return (n, o[0]) if o else (None, None)
-    return n, v
+def _select_values(ele: SelectElement) -> list[str]:
+    """Return the values of the selected options of a select element.
+
+    Disabled options and options of a disabled optgroup are skipped. When
+    no option is selected and the select is not multiple, the first
+    enabled option is returned, matching browser behavior.
+    """
+    options = [option for option in ele.iter("option") if _is_enabled_option(option)]
+    if ele.multiple:
+        return [_option_value(o) for o in options if o.get("selected") is not None]
+    selected = [o for o in options if o.get("selected") is not None]
+    if selected:
+        return [_option_value(selected[-1])]
+    return [_option_value(options[0])] if options else []
+
+
+def _is_enabled_option(option: HtmlElement) -> bool:
+    if option.get("disabled") is not None:
+        return False
+    optgroup = option.getparent()
+    return not (
+        optgroup is not None
+        and optgroup.tag == "optgroup"
+        and optgroup.get("disabled") is not None
+    )
+
+
+def _option_value(option: HtmlElement) -> str:
+    value = option.get("value")
+    if value is not None:
+        return value
+    return (option.text or "").strip()
 
 
 def _get_clickable(
-    clickdata: dict[str, str | int] | None, form: FormElement
-) -> tuple[str, str] | None:
+    clickdata: dict[str, str | int] | None, controls: list[HtmlElement]
+) -> HtmlElement | None:
+    """Return the clickable element specified in clickdata, if the latter is
+    given. If not, return the first clickable element found.
     """
-    Returns the clickable element specified in clickdata,
-    if the latter is given. If not, it returns the first
-    clickable element found
-    """
-    clickables = list(
-        form.xpath(
-            'descendant::input[re:test(@type, "^(submit|image)$", "i")]'
-            '|descendant::button[not(@type) or re:test(@type, "^submit$", "i")]',
-            namespaces={"re": "http://exslt.org/regular-expressions"},
-        )
-    )
+    clickables = [el for el in controls if _is_clickable(el)]
     if not clickables:
         return None
 
     # If we don't have clickdata, we just use the first clickable element
     if clickdata is None:
-        el = clickables[0]
-        return (el.get("name"), el.get("value") or "")
+        return clickables[0]
 
     # If clickdata is given, we compare it to the clickable elements to find a
     # match. We first look to see if the number is specified in clickdata,
@@ -305,21 +394,34 @@ def _get_clickable(
     if nr is not None:
         assert isinstance(nr, int)
         try:
-            el = list(form.inputs)[nr]
+            el = [c for c in controls if c.tag in ("input", "select", "textarea")][nr]
         except IndexError:
             pass
         else:
-            return (cast("str", el.get("name")), el.get("value") or "")
+            return el
 
-    # We didn't find it, so now we build an XPath expression out of the other
-    # arguments, because they can be used as such
-    xpath = ".//*" + "".join(f'[@{k}="{v}"]' for k, v in clickdata.items())
-    el = form.xpath(xpath)
-    if len(el) == 1:
-        return (el[0].get("name"), el[0].get("value") or "")
-    if len(el) > 1:
+    # We didn't find it, so now we match the other arguments against the
+    # attributes of the form controls
+    matches = [
+        el for el in controls if all(el.get(k) == str(v) for k, v in clickdata.items())
+    ]
+    if len(matches) == 1:
+        return matches[0]
+    if len(matches) > 1:
         raise ValueError(
-            f"Multiple elements found ({el!r}) matching the "
+            f"Multiple elements found ({matches!r}) matching the "
             f"criteria in clickdata: {clickdata!r}"
         )
     raise ValueError(f"No clickable element matching clickdata: {clickdata!r}")
+
+
+def _is_clickable(control: HtmlElement) -> bool:
+    """Return whether the control can be the clicked submitter."""
+    if _is_disabled(control):
+        return False
+    input_type = control.get("type")
+    if control.tag == "input":
+        return input_type is not None and input_type.lower() in ("submit", "image")
+    return control.tag == "button" and (
+        input_type is None or input_type.lower() == "submit"
+    )

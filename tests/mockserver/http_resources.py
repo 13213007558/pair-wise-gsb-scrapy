@@ -4,7 +4,7 @@ import gzip
 import json
 import random
 from typing import TYPE_CHECKING, Any, ClassVar, ParamSpec, TypeVar, cast
-from urllib.parse import urlencode
+from urllib.parse import parse_qsl, urlencode, urlsplit
 
 from twisted.internet.task import deferLater
 from twisted.web import resource, server
@@ -281,6 +281,26 @@ class Echo(LeafResource):
         return to_bytes(json.dumps(output))
 
     render_POST = render_GET
+
+
+class FormDump(LeafResource):
+    """Render the method, URL and decoded form fields of the request, the
+    latter in the order in which they were received.
+    """
+
+    def render(self, request: Request) -> bytes:
+        assert request.content
+        output = {
+            "method": to_unicode(request.method),
+            "uri": to_unicode(request.uri),
+            "query": parse_qsl(
+                urlsplit(to_unicode(request.uri)).query, keep_blank_values=True
+            ),
+            "body": parse_qsl(
+                to_unicode(request.content.read()), keep_blank_values=True
+            ),
+        }
+        return to_bytes(json.dumps(output))
 
 
 class RedirectTo(LeafResource):

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import re
 import warnings
 from typing import TYPE_CHECKING, Any
@@ -8,13 +9,19 @@ from urllib.parse import parse_qs, unquote_to_bytes
 import pytest
 
 from scrapy.exceptions import ScrapyDeprecationWarning
-from scrapy.http import FormRequest, HtmlResponse
+from scrapy.http import FormRequest, HtmlResponse, Request, TextResponse
 from scrapy.utils.httpobj import urlparse_cached
 from scrapy.utils.python import to_unicode
+from scrapy.utils.test import get_crawler
+from tests.spiders import RawResponseSpider
 from tests.utils.bases.http_request import TestRequestBase
+from tests.utils.decorators import coroutine_test
 
 if TYPE_CHECKING:
-    from scrapy import Request
+    from collections.abc import AsyncIterator
+
+    from scrapy.http import Response
+    from tests.mockserver.http import MockServer
 
 
 def _buildresponse(body: bytes | str, **kwargs: Any) -> HtmlResponse:
@@ -849,6 +856,141 @@ class TestFormRequest(TestRequestBase):
         fs = _qs(req)
         assert set(fs) == {b"h2", b"i2", b"i1", b"i3", b"h1", b"i5", b"i4"}
 
+    def test_from_response_form_attribute(self):
+        # Controls with a form attribute belong to the form with that id,
+        # wherever they are in the document, and are collected in document
+        # order.
+        response = _buildresponse(
+            """<input form="search" name="before" value="1">
+            <form id="search" action="/old" method="post">
+                <input name="inner" value="2">
+                <input form="other" name="stray" value="x">
+            </form>
+            <input form="search" name="q" value="book">
+            <form id="other"><input name="other-inner" value="y"></form>
+            <input name="ownerless" value="z">"""
+        )
+        req = self.request_class.from_response(
+            response, formid="search", dont_click=True
+        )
+        assert req.body == b"before=1&inner=2&q=book"
+
+    def test_from_response_form_attribute_without_form_id(self):
+        # A form attribute cannot target a form without an id.
+        response = _buildresponse(
+            """<form method="post"><input name="inner" value="1"></form>
+            <input form="search" name="outer" value="2">"""
+        )
+        req = self.request_class.from_response(response, dont_click=True)
+        assert req.body == b"inner=1"
+
+    def test_from_response_external_submit(self):
+        response = _buildresponse(
+            """<form id="search" action="/old"></form>
+            <input form="search" name="q" value="book">
+            <button form="search" name="go" value="1" formaction="/new">Search</button>"""
+        )
+        req = self.request_class.from_response(response, formid="search")
+        assert req.url == "http://example.com/new?q=book&go=1"
+        assert req.method == "GET"
+        fs = _qs(req)
+        assert fs == {b"q": [b"book"], b"go": [b"1"]}
+
+    def test_from_response_submitter_formaction_formmethod(self):
+        response = _buildresponse(
+            """<form action="/search" method="get">
+                <input name="q" value="book">
+                <input type="submit" name="page1" value="1">
+                <input type="submit" name="page2" value="2"
+                    formaction="/search2" formmethod="post">
+            </form>"""
+        )
+        req = self.request_class.from_response(response, clickdata={"name": "page2"})
+        assert req.url == "http://example.com/search2"
+        assert req.method == "POST"
+        fs = _qs(req)
+        assert fs == {b"q": [b"book"], b"page2": [b"2"]}
+
+    def test_from_response_overrides_submitter_formaction_formmethod(self):
+        response = _buildresponse(
+            """<form action="/search" method="get">
+                <input type="submit" name="go" value="1"
+                    formaction="/search2" formmethod="post">
+            </form>"""
+        )
+        req = self.request_class.from_response(response, url="/custom", method="GET")
+        assert req.url == "http://example.com/custom?go=1"
+        assert req.method == "GET"
+
+    def test_from_response_disabled_fieldset(self):
+        response = _buildresponse(
+            """<form>
+            <input name="a" value="1">
+            <fieldset disabled>
+                <input name="b" value="2">
+                <legend><input name="c" value="3"></legend>
+                <legend><input name="d" value="4"></legend>
+            </fieldset>
+            <fieldset disabled>
+                <input name="e" value="5">
+            </fieldset>
+            <fieldset>
+                <input name="f" value="6">
+            </fieldset>
+            <input name="g" value="7" disabled>
+            </form>"""
+        )
+        req = self.request_class.from_response(response, dont_click=True)
+        fs = _qs(req)
+        assert fs == {b"a": [b"1"], b"c": [b"3"], b"f": [b"6"]}
+
+    def test_from_response_disabled_submit_not_clicked(self):
+        response = _buildresponse(
+            """<form>
+            <input type="submit" name="a" value="1" disabled>
+            <input type="submit" name="b" value="2">
+            </form>"""
+        )
+        req = self.request_class.from_response(response)
+        fs = _qs(req)
+        assert fs == {b"b": [b"2"]}
+
+    def test_from_response_disabled_option_optgroup(self):
+        res = _buildresponse(
+            """<form>
+            <select name="i1">
+                <option value="i1v1" selected disabled>option 1</option>
+                <option value="i1v2">option 2</option>
+            </select>
+            <select name="i2">
+                <optgroup disabled>
+                    <option value="i2v1" selected>option 1</option>
+                </optgroup>
+                <option value="i2v2">option 2</option>
+            </select>
+            <select name="i3" multiple>
+                <option value="i3v1" selected disabled>option 1</option>
+                <option value="i3v2" selected>option 2</option>
+            </select>
+            <select name="i4">
+                <option value="i4v1" disabled>option 1</option>
+            </select>
+            </form>"""
+        )
+        req = self.request_class.from_response(res, dont_click=True)
+        fs = _qs_unicode(req)
+        assert fs == {"i1": ["i1v2"], "i2": ["i2v2"], "i3": ["i3v2"]}
+
+    def test_from_response_select_option_text_value(self):
+        res = _buildresponse(
+            """<form>
+            <select name="i1"><option>  text value  </option></select>
+            </form>"""
+        )
+        req = self.request_class.from_response(res, dont_click=True)
+        fs = _qs_unicode(req)
+        assert fs == {"i1": ["text value"]}
+
     def test_from_response_xpath(self):
         response = _buildresponse(
             """<form action="post.php" method="POST">
@@ -1068,3 +1210,90 @@ class TestFormRequest(TestRequestBase):
 
         with pytest.raises(ValueError, match="No <form> element found with"):
             FormRequest.from_response(response, formxpath='//div[@id="outside-form"]/p')
+
+
+FORM_PAGE = """<input form="search" name="head" value="1">
+<form id="search" action="formdump" method="post">
+    <input name="inner" value="2">
+    <input name="dup" value="3">
+    <input form="other" name="stray" value="x">
+    <input type="submit" name="send" value="1">
+</form>
+<input form="search" name="q" value="book">
+<input form="search" name="dup" value="4">
+<button form="search" name="go" value="1" formaction="formdump2" formmethod="get">
+    Search
+</button>
+<form id="other"><input name="other-inner" value="y"></form>"""
+
+
+class FormPageSpider(RawResponseSpider):
+    name = "formpage"
+    content_type = "text/html"
+    clickdata: dict[str, str] | None = None
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self.submissions: list[dict[str, Any]] = []
+
+    def raw_body(self) -> str:
+        return FORM_PAGE
+
+    async def start(self) -> AsyncIterator[Any]:
+        yield Request(self.raw_url)
+
+    def parse(self, response: Response) -> Any:
+        assert isinstance(response, TextResponse)
+        kwargs: dict[str, Any] = {"formid": "search"}
+        if self.clickdata is not None:
+            kwargs["clickdata"] = self.clickdata
+        yield FormRequest.from_response(response, callback=self.parse_dump, **kwargs)
+
+    def parse_dump(self, response: TextResponse) -> None:
+        self.submissions.append(json.loads(response.text))
+
+
+@pytest.mark.filterwarnings("ignore::scrapy.exceptions.ScrapyDeprecationWarning")
+class TestFormRequestFromResponseMockServer:
+    """Submit a form through the mock server and check what it receives.
+
+    The form page has controls before, inside and after the form, including
+    controls owned through the form attribute, controls with duplicate
+    names and an external submit button with its own action and method.
+    """
+
+    @coroutine_test
+    async def test_submit_form(self, mockserver: MockServer) -> None:
+        crawler = get_crawler(FormPageSpider)
+        await crawler.crawl_async(mockserver=mockserver)
+        assert isinstance(crawler.spider, FormPageSpider)
+        [submission] = crawler.spider.submissions
+        assert submission["method"] == "POST"
+        assert submission["uri"] == "/formdump"
+        assert submission["query"] == []
+        assert submission["body"] == [
+            ["head", "1"],
+            ["inner", "2"],
+            ["dup", "3"],
+            ["q", "book"],
+            ["dup", "4"],
+            ["send", "1"],
+        ]
+
+    @coroutine_test
+    async def test_submit_external_button(self, mockserver: MockServer) -> None:
+        crawler = get_crawler(FormPageSpider)
+        await crawler.crawl_async(mockserver=mockserver, clickdata={"name": "go"})
+        assert isinstance(crawler.spider, FormPageSpider)
+        [submission] = crawler.spider.submissions
+        assert submission["method"] == "GET"
+        assert submission["uri"].startswith("/formdump2?")
+        assert submission["body"] == []
+        assert submission["query"] == [
+            ["head", "1"],
+            ["inner", "2"],
+            ["dup", "3"],
+            ["q", "book"],
+            ["dup", "4"],
+            ["go", "1"],
+        ]

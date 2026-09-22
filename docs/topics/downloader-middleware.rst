@@ -351,6 +351,15 @@ HttpCacheMiddleware
     This middleware provides low-level cache to all HTTP requests and responses.
     It has to be combined with a cache storage backend as well as a cache policy.
 
+    .. versionchanged:: VERSION
+        Responses with a ``Vary`` header are cached as separate variants.
+
+    When a response has a ``Vary`` header, the built-in storage backends
+    store it as a separate variant, and only serve it for requests whose
+    headers named in the ``Vary`` header have the same values. Responses
+    with ``Vary: *`` are not cached. If the ``Vary`` header of a resource
+    changes, previously cached variants are discarded.
+
     Scrapy ships with the following HTTP cache storage backends:
 
         * :ref:`httpcache-storage-fs`
@@ -440,7 +449,6 @@ RFC2616 policy
     What is missing:
 
     * ``Pragma: no-cache`` support https://www.w3.org/Protocols/rfc2616/rfc2616-sec14.html#sec14.9.1
-    * ``Vary`` header support https://www.w3.org/Protocols/rfc2616/rfc2616-sec13.html#sec13.6
     * Invalidation after updates or deletes https://www.w3.org/Protocols/rfc2616/rfc2616-sec13.html#sec13.10
     * ... probably others ..
 
@@ -480,6 +488,10 @@ Filesystem storage backend (default)
     inefficient in many file systems). An example directory could be::
 
         /path/to/cache/dir/example.com/72/72811f648e718090f041317756c03adb0ada46c7
+
+    When a response has a ``Vary`` header, its files are stored in a
+    subdirectory of ``variants`` instead, and a ``vary_index`` file maps
+    the values of the selecting request headers to those subdirectories.
 
 .. _httpcache-storage-dbm:
 

@@ -1,14 +1,16 @@
 from __future__ import annotations
 
 import gzip
+import hashlib
 import logging
 import pickle
+import shutil
 from datetime import timezone
 from email.utils import parsedate_to_datetime
 from importlib import import_module
 from pathlib import Path
 from time import time
-from typing import IO, TYPE_CHECKING, Any, Concatenate, cast
+from typing import IO, TYPE_CHECKING, Any, Concatenate, TypeAlias, cast
 from weakref import WeakKeyDictionary
 
 from w3lib.http import headers_dict_to_raw, headers_raw_to_dict
@@ -24,6 +26,7 @@ if TYPE_CHECKING:
     from collections.abc import Callable
     from types import ModuleType
 
+    from scrapy.http import Headers
     from scrapy.http.request import Request
     from scrapy.settings import BaseSettings
     from scrapy.spiders import Spider
@@ -280,7 +283,18 @@ class DbmCacheStorage:
     def store_response(
         self, spider: Spider, request: Request, response: Response
     ) -> None:
+        vary = _parse_vary(response.headers)
+        if vary is None:
+            # Vary: * responses cannot be reused, so do not store them.
+            return
         key = self._fingerprinter.fingerprint(request).hex()
+        if vary:
+            self._store_variant(key, request, response, vary)
+            return
+        if f"{key}_vary" in self.db:
+            # The server no longer varies this resource, so the stored
+            # variants are not valid anymore.
+            self._delete_variants(key)
         self.db[f"{key}_data"] = pickle.dumps(response.to_dict(), protocol=4)
         self.db[f"{key}_time"] = str(time())
 
@@ -288,17 +302,78 @@ class DbmCacheStorage:
         self, spider: Spider, request: Request
     ) -> tuple[dict[str, Any], float] | None:
         key = self._fingerprinter.fingerprint(request).hex()
+        index_key = f"{key}_vary"
+        if index_key in self.db:
+            index = cast("dict[str, Any]", pickle.loads(self.db[index_key]))  # noqa: S301
+            selecting = _selecting_headers(request, index["vary"])
+            for variant in index["variants"]:
+                if variant["headers"] == selecting:
+                    vkey = f"{key}_variant_{variant['id']}"
+                    return self._read_entry(f"{vkey}_data", f"{vkey}_time")
+            return None  # no variant matches the request
+        return self._read_entry(f"{key}_data", f"{key}_time")
+
+    def _read_entry(
+        self, data_key: str, time_key: str
+    ) -> tuple[dict[str, Any], float] | None:
         db = self.db
-        tkey = f"{key}_time"
-        if tkey not in db:
+        if time_key not in db:
             return None  # not found
 
-        ts = float(db[tkey])
+        ts = float(db[time_key])
         if 0 < self.expiration_secs < time() - ts:
             return None  # expired
 
-        data = cast("dict[str, Any]", pickle.loads(db[f"{key}_data"]))  # noqa: S301
+        data = cast("dict[str, Any]", pickle.loads(db[data_key]))  # noqa: S301
         return data, ts
+
+    def _store_variant(
+        self, key: str, request: Request, response: Response, vary: list[bytes]
+    ) -> None:
+        index_key = f"{key}_vary"
+        try:
+            index = (
+                cast("dict[str, Any]", pickle.loads(self.db[index_key]))  # noqa: S301
+                if index_key in self.db
+                else None
+            )
+        except Exception:
+            index = None  # corrupted index, start over
+        if index is None or index["vary"] != vary:
+            # The server changed the set of selecting headers, so variants
+            # stored for the old set are not valid anymore.
+            if index is not None:
+                self._delete_variant_keys(key, index)
+            index = {"vary": vary, "variants": []}
+        selecting = _selecting_headers(request, vary)
+        variant = next(
+            (v for v in index["variants"] if v["headers"] == selecting), None
+        )
+        if variant is None:
+            variant = {"id": _variant_id(selecting), "headers": selecting}
+            index["variants"].append(variant)
+        vkey = f"{key}_variant_{variant['id']}"
+        self.db[f"{vkey}_data"] = pickle.dumps(response.to_dict(), protocol=4)
+        self.db[f"{vkey}_time"] = str(time())
+        self.db[index_key] = pickle.dumps(index, protocol=4)
+
+    def _delete_variants(self, key: str) -> None:
+        index_key = f"{key}_vary"
+        try:
+            index = cast("dict[str, Any]", pickle.loads(self.db[index_key]))  # noqa: S301
+        except Exception:
+            del self.db[index_key]
+            return  # corrupted index, the variant keys are not recoverable
+        self._delete_variant_keys(key, index)
+        del self.db[index_key]
+
+    def _delete_variant_keys(self, key: str, index: dict[str, Any]) -> None:
+        for variant in index["variants"]:
+            vkey = f"{key}_variant_{variant['id']}"
+            for suffix in ("data", "time"):
+                entry_key = f"{vkey}_{suffix}"
+                if entry_key in self.db:
+                    del self.db[entry_key]
 
 
 class FilesystemCacheStorage:
@@ -327,10 +402,10 @@ class FilesystemCacheStorage:
 
     def retrieve_response(self, spider: Spider, request: Request) -> Response | None:
         """Return response if present in cache, or None otherwise."""
-        metadata = self._read_meta(spider, request)
-        if metadata is None:
+        found = self._read_meta(spider, request)
+        if found is None:
             return None  # not cached
-        rpath = Path(self._get_request_path(spider, request))
+        metadata, rpath = found
         with self._open(rpath / "response_body", "rb") as f:
             body = f.read()
         with self._open(rpath / "response_headers", "rb") as f:
@@ -352,7 +427,24 @@ class FilesystemCacheStorage:
         self, spider: Spider, request: Request, response: Response
     ) -> None:
         """Store the given response in the cache."""
+        vary = _parse_vary(response.headers)
+        if vary is None:
+            # Vary: * responses cannot be reused, so do not store them.
+            return
         rpath = Path(self._get_request_path(spider, request))
+        if vary:
+            self._store_variant(rpath, request, response, vary)
+            return
+        if (rpath / "vary_index").exists():
+            # The server no longer varies this resource, so the stored
+            # variants are not valid anymore.
+            shutil.rmtree(rpath / "variants", ignore_errors=True)
+            (rpath / "vary_index").unlink()
+        self._write_response(rpath, request, response)
+
+    def _write_response(
+        self, rpath: Path, request: Request, response: Response
+    ) -> None:
         if not rpath.exists():
             rpath.mkdir(parents=True)
         metadata = {
@@ -382,12 +474,57 @@ class FilesystemCacheStorage:
         with self._open(rpath / "request_body", "wb") as f:
             f.write(request.body)
 
+    def _store_variant(
+        self, rpath: Path, request: Request, response: Response, vary: list[bytes]
+    ) -> None:
+        try:
+            index = self._read_vary_index(rpath)
+        except Exception:
+            index = None  # corrupted index, start over
+        if index is None or index["vary"] != vary:
+            # The server changed the set of selecting headers, so variants
+            # stored for the old set are not valid anymore.
+            shutil.rmtree(rpath / "variants", ignore_errors=True)
+            index = {"vary": vary, "variants": []}
+        selecting = _selecting_headers(request, vary)
+        variant = next(
+            (v for v in index["variants"] if v["headers"] == selecting), None
+        )
+        if variant is None:
+            variant = {"id": _variant_id(selecting), "headers": selecting}
+            index["variants"].append(variant)
+        self._write_response(rpath / "variants" / variant["id"], request, response)
+        with self._open(rpath / "vary_index", "wb") as f:
+            pickle.dump(index, f, protocol=4)
+
     def _get_request_path(self, spider: Spider, request: Request) -> str:
         key = self._fingerprinter.fingerprint(request).hex()
         return str(Path(self.cachedir, spider.name, key[0:2], key))
 
-    def _read_meta(self, spider: Spider, request: Request) -> dict[str, Any] | None:
+    def _read_meta(
+        self, spider: Spider, request: Request
+    ) -> tuple[dict[str, Any], Path] | None:
         rpath = Path(self._get_request_path(spider, request))
+        index = self._read_vary_index(rpath)
+        if index is None:
+            metadata = self._read_meta_at(rpath)
+            return (metadata, rpath) if metadata is not None else None
+        selecting = _selecting_headers(request, index["vary"])
+        for variant in index["variants"]:
+            if variant["headers"] == selecting:
+                vpath = rpath / "variants" / variant["id"]
+                metadata = self._read_meta_at(vpath)
+                return (metadata, vpath) if metadata is not None else None
+        return None  # no variant matches the request
+
+    def _read_vary_index(self, rpath: Path) -> dict[str, Any] | None:
+        index_path = rpath / "vary_index"
+        if not index_path.exists():
+            return None
+        with self._open(index_path, "rb") as f:
+            return cast("dict[str, Any]", pickle.load(f))  # noqa: S301
+
+    def _read_meta_at(self, rpath: Path) -> dict[str, Any] | None:
         metapath = rpath / "pickled_meta"
         if not metapath.exists():
             return None  # not found
@@ -433,3 +570,45 @@ def rfc1123_to_epoch(date_str: str | bytes | None) -> int | None:
         return int(date.timestamp())
     except Exception:
         return None
+
+
+def _parse_vary(headers: Headers) -> list[bytes] | None:
+    """Return the sorted list of selecting header names from the Vary
+    response header, or ``None`` if the response must not be reused.
+
+    Header names are lowercased, as header field names are
+    case-insensitive. A ``Vary: *`` response can never be reused, which is
+    signaled by returning ``None``.
+    """
+    vary: set[bytes] = set()
+    for value in headers.getlist(b"Vary"):
+        for raw_name in value.split(b","):
+            name = raw_name.strip().lower()
+            if name == b"*":
+                return None
+            if name:
+                vary.add(name)
+    return sorted(vary)
+
+
+# Maps each selecting header name to the values it has in the request, or
+# to None when the request does not include the header, which is not the
+# same as including it with an empty value.
+_SelectingHeaders: TypeAlias = dict[bytes, tuple[bytes, ...] | None]
+
+
+def _selecting_headers(request: Request, vary: list[bytes]) -> _SelectingHeaders:
+    """Return the values that the *vary* header names have in *request*."""
+    return {
+        name: tuple(request.headers.getlist(name)) if name in request.headers else None
+        for name in vary
+    }
+
+
+def _variant_id(selecting_headers: _SelectingHeaders) -> str:
+    """Return a stable identifier for a variant from its selecting headers."""
+    # The vary list is sorted, so the dict order, and hence the pickle, is
+    # deterministic.
+    return hashlib.sha1(  # noqa: S324
+        pickle.dumps(selecting_headers, protocol=4)
+    ).hexdigest()

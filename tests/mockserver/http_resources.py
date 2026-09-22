@@ -283,6 +283,53 @@ class Echo(LeafResource):
     render_POST = render_GET
 
 
+class VaryLanguageResource(BaseResource):
+    """Serve a different body per Accept-Language, with ETag and Vary.
+
+    Received request headers are logged; the ``log`` child resource
+    returns the log as JSON and clears it when passed ``?reset=1``.
+    """
+
+    bodies: ClassVar[dict[bytes, tuple[bytes, bytes]]] = {
+        b"zh": ("\u4e2d\u6587\u5185\u5bb9".encode(), b'"zh-v1"'),
+        b"en": (b"English content", b'"en-v1"'),
+    }
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.requests: list[dict[str, list[str]]] = []
+        put_child(self, b"log", VaryLanguageLogResource(self))
+
+    def render_GET(self, request: Request) -> bytes:
+        self.requests.append(
+            {
+                to_unicode(k): [to_unicode(v) for v in vs]
+                for k, vs in request.requestHeaders.getAllRawHeaders()
+            }
+        )
+        body, etag = self.bodies.get(
+            request.getHeader(b"Accept-Language") or b"", self.bodies[b"en"]
+        )
+        request.setHeader(b"Vary", b"Accept-Language")
+        request.setHeader(b"ETag", etag)
+        if request.getHeader(b"If-None-Match") == etag:
+            request.setResponseCode(304)
+            return b""
+        request.setHeader(b"Content-Type", b"text/html; charset=utf-8")
+        return body
+
+
+class VaryLanguageLogResource(BaseResource):
+    def __init__(self, vary_language: VaryLanguageResource) -> None:
+        super().__init__()
+        self._vary_language = vary_language
+
+    def render_GET(self, request: Request) -> bytes:
+        if getarg(request, b"reset") is not None:
+            self._vary_language.requests.clear()
+        return to_bytes(json.dumps(self._vary_language.requests))
+
+
 class RedirectTo(LeafResource):
     def render(self, request: Request) -> bytes:
         goto = getarg(request, b"goto", b"/")

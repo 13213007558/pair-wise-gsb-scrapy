@@ -44,6 +44,7 @@ from .http_resources import (
     SetCookie,
     Status,
     UriResource,
+    VaryLanguageResource,
     put_child,
 )
 
@@ -103,6 +104,7 @@ class Root(BaseResource):
         put_child(self, b"response-headers", ResponseHeadersResource())
         put_child(self, b"set-cookie", SetCookie())
         put_child(self, b"uri", UriResource())
+        put_child(self, b"vary-language", VaryLanguageResource())
         put_child(self, b"h2-reset-stream", H2ResetStream())
         put_child(self, b"h2-data-and-reset", H2DataAndReset())
         put_child(self, b"h2-goaway", H2GoAway())

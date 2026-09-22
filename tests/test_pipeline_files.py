@@ -1,3 +1,4 @@
+import asyncio
 import base64
 import dataclasses
 import logging
@@ -411,6 +412,45 @@ class TestFilesPipeline:
         path = Path(self.tempdir) / result["files"][0]["path"]
         assert path.exists()
         assert path.read_bytes() == b"data"
+
+    @coroutine_test
+    async def test_shared_download_processed_per_item(self) -> None:
+        """Two items referencing the same URL share a single download, but
+        each one gets its own file_path() and file_downloaded() processing,
+        so per-item paths do not leak into other item results."""
+
+        class CategorizedFilesPipeline(FilesPipeline):
+            def file_path(self, request, response=None, info=None, *, item=None):
+                return f"{item['category']}/file.bin"
+
+        pipeline = self._create_pipeline(CategorizedFilesPipeline)
+        downloads = 0
+
+        async def download_func(request):
+            nonlocal downloads
+            downloads += 1
+            await asyncio.sleep(0.01)
+            return Response(request.url, body=b"data")
+
+        pipeline.crawler.engine.download_async = download_func
+        url = "http://example.com/file.bin"
+        item1 = {"category": "cat1", "file_urls": [url]}
+        item2 = {"category": "cat2", "file_urls": [url]}
+        result1, result2 = await asyncio.gather(
+            pipeline.process_item(item1), pipeline.process_item(item2)
+        )
+
+        assert downloads == 1
+        file_info1 = result1["files"][0]
+        file_info2 = result2["files"][0]
+        assert file_info1["path"] == "cat1/file.bin"
+        assert file_info2["path"] == "cat2/file.bin"
+        assert file_info1 is not file_info2
+        assert file_info1["checksum"] == file_info2["checksum"]
+        cat1_file = Path(self.tempdir) / "cat1" / "file.bin"
+        cat2_file = Path(self.tempdir) / "cat2" / "file.bin"
+        assert cat1_file.read_bytes() == b"data"
+        assert cat2_file.read_bytes() == b"data"
 
     def test_file_path_from_item(self):
         """

@@ -10,6 +10,7 @@ import pytest
 from w3lib.url import add_or_replace_parameter
 
 from scrapy import Spider, signals
+from scrapy.pipelines.images import ImagesPipeline
 from scrapy.utils.misc import load_object
 from scrapy.utils.test import get_crawler
 from tests.mockserver.http import MockServer
@@ -59,6 +60,21 @@ class RedirectedMediaDownloadSpider(MediaDownloadSpider):
         return add_or_replace_parameter(
             self.mockserver.url("/redirect-to"), "goto", url
         )
+
+
+class DuplicateMediaSpider(SimpleSpider):
+    """Yields two items that reference the same media URL but belong to
+    different categories, so that a pipeline can route them to different
+    paths based on the item."""
+
+    name = "duplicatemedia"
+
+    media_url: str
+    media_urls_key: str
+
+    async def start(self):
+        for category in ("cat1", "cat2"):
+            yield {"category": category, self.media_urls_key: [self.media_url]}
 
 
 class TestFileDownloadCrawl:
@@ -233,6 +249,42 @@ class TestFileDownloadCrawl:
             )
         assert "ZeroDivisionError" in caplog.text
 
+    @coroutine_test
+    async def test_download_media_shared_by_items(self) -> None:
+        """Two items referencing the same media URL share a single download,
+        but each item gets its own file_path() result."""
+        cls = load_object(self.pipeline_class)
+
+        class CategorizedMediaPipeline(cls):  # type: ignore[misc,valid-type]
+            def file_path(self, request, response=None, info=None, *, item=None):
+                return f"{item['category']}/file"
+
+        settings = {
+            **self.settings,
+            "ITEM_PIPELINES": {CategorizedMediaPipeline: 1},
+        }
+        crawler = self._create_crawler(DuplicateMediaSpider, settings)
+        await crawler.crawl_async(
+            media_url=self.mockserver.url("/static/files/images/scrapy.png"),
+            media_urls_key=self.media_urls_key,
+        )
+
+        # the shared media URL was downloaded only once
+        assert crawler.stats.get_value("downloader/response_count") == 1
+
+        assert len(self.items) == 2
+        results = {}
+        for item in self.items:
+            file_info = item[self.media_key][0]
+            assert file_info["path"] == f"{item['category']}/file"
+            assert file_info["status"] == "downloaded"
+            results[item["category"]] = file_info
+        # each item got its own result object
+        assert results["cat1"] is not results["cat2"]
+        content1 = (self.tmpmediastore / "cat1" / "file").read_bytes()
+        content2 = (self.tmpmediastore / "cat2" / "file").read_bytes()
+        assert content1 == content2
+
 
 pillow_available: bool
 try:
@@ -255,3 +307,39 @@ class TestImageDownloadCrawl(TestFileDownloadCrawl):
 
     # somehow checksums for images are different for Python 3.3
     expected_checksums = None
+
+    @coroutine_test
+    async def test_download_media_shared_by_items_thumbnails(self) -> None:
+        """When several items share one downloaded image, thumbnail paths
+        are also computed per item."""
+
+        class CategorizedImagesPipeline(ImagesPipeline):
+            def file_path(self, request, response=None, info=None, *, item=None):
+                return f"{item['category']}/full.jpg"
+
+            def thumb_path(
+                self, request, thumb_id, response=None, info=None, *, item=None
+            ):
+                return f"{item['category']}/thumbs/{thumb_id}.jpg"
+
+        settings = {
+            **self.settings,
+            "ITEM_PIPELINES": {CategorizedImagesPipeline: 1},
+            "IMAGES_THUMBS": {"small": (10, 10)},
+        }
+        crawler = self._create_crawler(DuplicateMediaSpider, settings)
+        await crawler.crawl_async(
+            media_url=self.mockserver.url("/static/files/images/scrapy.png"),
+            media_urls_key=self.media_urls_key,
+        )
+
+        # the shared media URL was downloaded only once
+        assert crawler.stats.get_value("downloader/response_count") == 1
+
+        assert len(self.items) == 2
+        for item in self.items:
+            category = item["category"]
+            image_info = item[self.media_key][0]
+            assert image_info["path"] == f"{category}/full.jpg"
+            assert (self.tmpmediastore / category / "full.jpg").exists()
+            assert (self.tmpmediastore / category / "thumbs" / "small.jpg").exists()

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import logging
 from typing import TYPE_CHECKING, Any, cast
 from unittest.mock import MagicMock
@@ -444,7 +445,7 @@ class TestMediaPipeline(TestBaseMediaPipeline):
 
         async def rsp1_func():
             await _process_pending_io()
-            _check_downloading(rsp1)
+            return _check_downloading(rsp1)
 
         async def rsp2_func():
             pytest.fail("it must cache rsp1 result and must not try to redownload")
@@ -482,6 +483,193 @@ class TestAsyncMediaDownloaded(TestMediaPipeline):
             self.pipe._key_for_pipe("IMAGES", base_class_name="MediaPipeline")
             == "ASYNCMEDIADOWNLOADEDPIPELINE_IMAGES"
         )
+
+
+class PerItemMediaPipeline(MockedMediaPipeline):
+    """A pipeline that includes item data in each media_downloaded() result
+    and raises for items with a true "fail" field."""
+
+    def media_downloaded(
+        self,
+        response: Response,
+        request: Request,
+        info: MediaPipeline.SpiderInfo,
+        *,
+        item: Any = None,
+    ) -> FileInfo | Awaitable[FileInfo]:
+        self._mockcalled.append("media_downloaded")
+        if item.get("fail"):
+            raise FileException(f"cannot process {item['name']}")
+        return cast("FileInfo", {"url": request.url, "item_name": item["name"]})
+
+
+class TestPerItemResults(TestBaseMediaPipeline):
+    """Items referencing the same URL share a single download, but each item
+    gets its own media_downloaded() processing and result."""
+
+    pipeline_class = PerItemMediaPipeline
+
+    def _mock_download(self, download_func) -> None:
+        self.pipe.crawler.engine.download_async = download_func
+
+    @coroutine_test
+    async def test_media_downloaded_called_per_item(self):
+        downloads = 0
+
+        async def download_func(request):
+            nonlocal downloads
+            downloads += 1
+            return Response(request.url, body=b"data")
+
+        self._mock_download(download_func)
+        item1 = {"name": "item1", "requests": Request("http://url1")}
+        item2 = {"name": "item2", "requests": Request("http://url1")}
+        new_item1 = await self.pipe.process_item(item1)
+        new_item2 = await self.pipe.process_item(item2)
+
+        assert downloads == 1
+        assert self.mocked_pipe._mockcalled.count("media_downloaded") == 2
+        result1 = new_item1["results"][0][1]
+        result2 = new_item2["results"][0][1]
+        assert result1 == {"url": "http://url1", "item_name": "item1"}
+        assert result2 == {"url": "http://url1", "item_name": "item2"}
+        # results are independent objects, mutating one does not leak
+        assert result1 is not result2
+        result1["item_name"] = "changed"
+        assert result2["item_name"] == "item2"
+
+    @coroutine_test
+    async def test_concurrent_items_share_the_download(self):
+        downloads = 0
+        pipe = self.mocked_pipe
+
+        async def download_func(request):
+            nonlocal downloads
+            downloads += 1
+            await _process_pending_io()
+            # both items are already waiting for the shared download
+            assert len(pipe.spiderinfo.waiting[self.fingerprint(request)]) == 2
+            return Response(request.url, body=b"data")
+
+        self._mock_download(download_func)
+        item1 = {"name": "item1", "requests": Request("http://url1")}
+        item2 = {"name": "item2", "requests": Request("http://url1")}
+        new_item1, new_item2 = await asyncio.gather(
+            self.pipe.process_item(item1), self.pipe.process_item(item2)
+        )
+
+        assert downloads == 1
+        assert new_item1["results"][0] == (
+            True,
+            {"url": "http://url1", "item_name": "item1"},
+        )
+        assert new_item2["results"][0] == (
+            True,
+            {"url": "http://url1", "item_name": "item2"},
+        )
+
+    @coroutine_test
+    async def test_item_failure_does_not_change_other_item_results(self):
+        self.pipe.LOG_FAILED_RESULTS = False
+
+        async def download_func(request):
+            return Response(request.url, body=b"data")
+
+        self._mock_download(download_func)
+        failing_item = {
+            "name": "failing",
+            "fail": True,
+            "requests": Request("http://url1"),
+        }
+        ok_item = {"name": "ok", "requests": Request("http://url1")}
+        new_failing = await self.pipe.process_item(failing_item)
+        new_ok = await self.pipe.process_item(ok_item)
+
+        assert new_failing["results"][0][0] is False
+        assert isinstance(new_failing["results"][0][1].value, FileException)
+        assert new_ok["results"][0] == (True, {"url": "http://url1", "item_name": "ok"})
+
+    @coroutine_test
+    async def test_item_success_does_not_change_other_item_results(self):
+        self.pipe.LOG_FAILED_RESULTS = False
+
+        async def download_func(request):
+            return Response(request.url, body=b"data")
+
+        self._mock_download(download_func)
+        ok_item = {"name": "ok", "requests": Request("http://url1")}
+        failing_item = {
+            "name": "failing",
+            "fail": True,
+            "requests": Request("http://url1"),
+        }
+        new_ok = await self.pipe.process_item(ok_item)
+        new_failing = await self.pipe.process_item(failing_item)
+
+        assert new_ok["results"][0] == (True, {"url": "http://url1", "item_name": "ok"})
+        assert new_failing["results"][0][0] is False
+        assert isinstance(new_failing["results"][0][1].value, FileException)
+
+    @coroutine_test
+    async def test_concurrent_item_failure_does_not_leak_to_other_items(self):
+        self.pipe.LOG_FAILED_RESULTS = False
+
+        async def download_func(request):
+            await _process_pending_io()
+            return Response(request.url, body=b"data")
+
+        self._mock_download(download_func)
+        items = [
+            {"name": "ok1", "requests": Request("http://url1")},
+            {"name": "failing", "fail": True, "requests": Request("http://url1")},
+            {"name": "ok2", "requests": Request("http://url1")},
+        ]
+        new_items = await asyncio.gather(
+            *(self.pipe.process_item(item) for item in items)
+        )
+
+        assert new_items[0]["results"][0] == (
+            True,
+            {"url": "http://url1", "item_name": "ok1"},
+        )
+        assert new_items[1]["results"][0][0] is False
+        assert isinstance(new_items[1]["results"][0][1].value, FileException)
+        assert new_items[2]["results"][0] == (
+            True,
+            {"url": "http://url1", "item_name": "ok2"},
+        )
+
+    @coroutine_test
+    async def test_shared_download_failure_reaches_all_items(self):
+        self.pipe.LOG_FAILED_RESULTS = False
+        downloads = 0
+        exc = Exception("download failed")
+
+        async def download_func(request):
+            nonlocal downloads
+            downloads += 1
+            await _process_pending_io()
+            raise exc
+
+        self._mock_download(download_func)
+        errbacks = []
+
+        def errback(failure):
+            errbacks.append(failure)
+            return failure
+
+        item1 = {"name": "item1", "requests": Request("http://url1", errback=errback)}
+        item2 = {"name": "item2", "requests": Request("http://url1", errback=errback)}
+        new_item1, new_item2 = await asyncio.gather(
+            self.pipe.process_item(item1), self.pipe.process_item(item2)
+        )
+
+        assert downloads == 1
+        assert self.mocked_pipe._mockcalled.count("media_failed") == 1
+        assert len(errbacks) == 2
+        for new_item in (new_item1, new_item2):
+            assert new_item["results"][0][0] is False
+            assert new_item["results"][0][1].value is exc
 
 
 class TestMediaPipelineAllowRedirectSettings:

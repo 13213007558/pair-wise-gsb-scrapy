@@ -432,6 +432,59 @@ To pass a parameter to your plugin, use :ref:`feed options <feed-options>`. You
 can then access those parameters from the ``__init__`` method of your plugin.
 
 
+.. _feed-manifest:
+
+Commit manifests
+================
+
+A feed defined through :setting:`FEEDS` can declare a ``manifest`` key with
+the path of a JSON file where Scrapy records every batch file that has been
+fully exported, post-processed and stored. Downstream consumers can then
+limit themselves to the files listed in the manifest, and never read a
+partial batch file left behind by a crashed or interrupted run.
+
+.. versionadded:: VERSION
+
+The ``manifest`` key is only supported for feeds stored in the
+:ref:`local file system <topics-feed-storage-fs>`.
+
+Each manifest entry records the batch ID (``batch_id``), the file path
+(``file``), the item count (``itemcount``), the file size in bytes
+(``bytes``) and the SHA-256 hash of the file contents (``sha256``).
+For example:
+
+.. code-block:: json
+
+    {
+        "version": 1,
+        "feed": "items-%(batch_id)d.jl.gz",
+        "config_sha256": "…",
+        "batches": [
+            {
+                "batch_id": 1,
+                "file": "/path/to/items-1.jl.gz",
+                "itemcount": 100,
+                "bytes": 1024,
+                "sha256": "…"
+            }
+        ]
+    }
+
+Every commit rewrites the manifest atomically, so readers either see the
+previous manifest or the new one, never a partially-written file. A batch
+is committed only after its file has been stored, so a failed store or an
+interrupted run leaves no trace in the manifest.
+
+When a crawl starts and the manifest file already exists, Scrapy validates
+it before exporting anything: the feed options must match the ones the
+manifest was written with, and every committed file must exist and match
+its recorded size and SHA-256 hash. If validation fails, the crawl does
+not start, and the error message points out the offending batch. If
+validation succeeds, the crawl resumes batch numbering after the highest
+committed batch ID, files of committed batches are never overwritten, and
+leftover files of uncommitted batches are written again from scratch.
+
+
 Settings
 ========
 
@@ -526,6 +579,14 @@ as a fallback value if that key is not provided for a specific feed definition:
 -   ``indent``: falls back to :setting:`FEED_EXPORT_INDENT`.
 
 -   ``item_export_kwargs``: :class:`dict` with keyword arguments for the corresponding :ref:`item exporter class <topics-exporters>`.
+
+-   ``manifest``: path of a JSON file where Scrapy records the batch
+    files that have been fully exported, post-processed and stored, so
+    that downstream consumers can tell complete files from partial ones.
+
+    .. versionadded:: VERSION
+
+    See :ref:`feed-manifest`.
 
 -   ``overwrite``: whether to overwrite the file if it already exists
     (``True``) or append to its content (``False``).

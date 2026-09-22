@@ -8,7 +8,10 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import hashlib
+import json
 import logging
+import os
 import re
 import sys
 import warnings
@@ -26,7 +29,7 @@ from w3lib.url import file_uri_to_path
 from zope.interface import Interface
 
 from scrapy import Spider, signals
-from scrapy.exceptions import NotConfigured, ScrapyDeprecationWarning
+from scrapy.exceptions import CloseSpider, NotConfigured, ScrapyDeprecationWarning
 from scrapy.extensions.postprocessing import PostProcessingManager
 from scrapy.utils._ftp import ftp_store_file
 from scrapy.utils.asyncio import is_asyncio_available, run_in_thread
@@ -201,6 +204,130 @@ class FileFeedStorage:
     def store(self, file: IO[bytes]) -> Deferred[None] | None:
         file.close()
         return None
+
+
+def _jsonable(value: Any) -> Any:
+    """Return a JSON-serializable representation of *value* that is stable
+    across processes, so that it can be hashed to compare feed options."""
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    if isinstance(value, (list, tuple)):
+        return [_jsonable(item) for item in value]
+    if isinstance(value, dict):
+        return {str(key): _jsonable(item) for key, item in value.items()}
+    if isinstance(value, type) or callable(value):
+        module = getattr(value, "__module__", None) or type(value).__module__
+        qualname = getattr(value, "__qualname__", None) or type(value).__qualname__
+        return f"{module}.{qualname}"
+    return str(value)
+
+
+def _config_fingerprint(feed_options: dict[str, Any]) -> str:
+    """Return a hash of the feed options that determine the output files."""
+    options = {k: v for k, v in feed_options.items() if k != "manifest"}
+    serialized = json.dumps(_jsonable(options), sort_keys=True)
+    return hashlib.sha256(serialized.encode()).hexdigest()
+
+
+def _file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as f:
+        for chunk in iter(lambda: f.read(65536), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+class _FeedManifest:
+    """Commit log of the finished batch files of a single feed.
+
+    A batch is committed only after its file has been fully exported,
+    post-processed and stored, so consumers that only read files listed in
+    the manifest never see a partial batch. Every commit rewrites the
+    manifest atomically.
+    """
+
+    def __init__(
+        self, path: str | Path, uri_template: str, feed_options: dict[str, Any]
+    ):
+        self.path: Path = Path(path)
+        self.uri_template: str = uri_template
+        self.config_sha256: str = _config_fingerprint(feed_options)
+        self.batches: list[dict[str, Any]] = []
+        if self.path.exists():
+            self._load()
+
+    def _load(self) -> None:
+        try:
+            data = json.loads(self.path.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as e:
+            raise ValueError(f"Cannot parse feed manifest {self.path}: {e}") from e
+        if not isinstance(data, dict) or data.get("version") != 1:
+            raise ValueError(f"Unsupported feed manifest format: {self.path}")
+        batches = data.get("batches")
+        if not isinstance(batches, list):
+            raise ValueError(f"Unsupported feed manifest format: {self.path}")
+        if data.get("config_sha256") != self.config_sha256:
+            raise ValueError(
+                f"Feed manifest {self.path} was written with different feed "
+                f"options for {self.uri_template!r}; refusing to resume"
+            )
+        for entry in batches:
+            batch_id = entry["batch_id"]
+            file = Path(entry["file"])
+            if not file.is_file():
+                raise ValueError(
+                    f"Feed manifest {self.path}: file {file} of batch "
+                    f"{batch_id} is missing"
+                )
+            if file.stat().st_size != entry["bytes"]:
+                raise ValueError(
+                    f"Feed manifest {self.path}: file {file} of batch "
+                    f"{batch_id} has a different size than recorded"
+                )
+            if _file_sha256(file) != entry["sha256"]:
+                raise ValueError(
+                    f"Feed manifest {self.path}: file {file} of batch "
+                    f"{batch_id} does not match its recorded SHA-256"
+                )
+        self.batches = batches
+
+    @property
+    def next_batch_id(self) -> int:
+        """Lowest batch ID greater than every committed one."""
+        return max((entry["batch_id"] for entry in self.batches), default=0) + 1
+
+    @property
+    def committed_files(self) -> set[str]:
+        return {entry["file"] for entry in self.batches}
+
+    def commit(self, storage: FileFeedStorage, batch_id: int, itemcount: int) -> None:
+        """Record the stored file of batch *batch_id* in the manifest."""
+        file = Path(storage.path).absolute()
+        self.batches.append(
+            {
+                "batch_id": batch_id,
+                "file": str(file),
+                "itemcount": itemcount,
+                "bytes": file.stat().st_size,
+                "sha256": _file_sha256(file),
+            }
+        )
+        self._write()
+
+    def _write(self) -> None:
+        if not self.path.parent.is_dir():
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+        data = {
+            "version": 1,
+            "feed": self.uri_template,
+            "config_sha256": self.config_sha256,
+            "batches": sorted(self.batches, key=lambda entry: entry["batch_id"]),
+        }
+        # Write to a sibling file and rename it, so that readers either see
+        # the whole previous manifest or the whole new one.
+        tmp = self.path.with_name(f"{self.path.name}.{os.getpid()}.tmp")
+        tmp.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+        os.replace(tmp, self.path)
 
 
 class S3FeedStorage(BlockingFeedStorage):
@@ -499,6 +626,7 @@ class FeedExporter:
         self.feeds: dict[str, dict[str, Any]] = {}
         self.slots: list[FeedSlot] = []
         self.filters: dict[str, ItemFilter] = {}
+        self.manifests: dict[str, _FeedManifest] = {}
         self._pending_close_tasks: list[asyncio.Task[None] | Deferred[None]] = []
 
         if not self.settings["FEEDS"] and not self.settings["FEED_URI"]:
@@ -548,13 +676,56 @@ class FeedExporter:
                 raise NotConfigured
             if not self._exporter_supported(feed_options["format"]):
                 raise NotConfigured
+        self._load_manifests()
+
+    def _load_manifests(self) -> None:
+        """Set up the commit manifest of every feed that declares one.
+
+        Loading an existing manifest validates the committed files and the
+        feed options they were written with, and raises if they do not
+        match, so that a crawl never starts on top of inconsistent output.
+        """
+        manifest_paths: set[Path] = set()
+        for uri, feed_options in self.feeds.items():
+            manifest_path = feed_options.get("manifest")
+            if not manifest_path:
+                continue
+            storage_cls = self.storages.get(
+                urlparse(uri).scheme, self.storages["file"]
+            )
+            if not (
+                isinstance(storage_cls, type)
+                and issubclass(storage_cls, FileFeedStorage)
+            ):
+                raise NotConfigured(
+                    f"The 'manifest' feed option is only supported with "
+                    f"local file storage, got feed URI {uri!r}"
+                )
+            path = Path(manifest_path)
+            if path in manifest_paths:
+                raise NotConfigured(
+                    f"Feeds cannot share a manifest file: {manifest_path}"
+                )
+            manifest_paths.add(path)
+            self.manifests[uri] = _FeedManifest(path, uri, feed_options)
 
     def open_spider(self, spider: Spider) -> None:
         for uri, feed_options in self.feeds.items():
             uri_params = self._get_uri_params(spider, feed_options["uri_params"])
+            batch_id = 1
+            manifest = self.manifests.get(uri)
+            if manifest is not None:
+                batch_id = manifest.next_batch_id
+                uri_params["batch_id"] = batch_id
+                if manifest.batches:
+                    logger.info(
+                        f"Resuming feed {uri} at batch {batch_id}: "
+                        f"{len(manifest.batches)} batches already committed "
+                        f"in {manifest.path}"
+                    )
             self.slots.append(
                 self._start_new_batch(
-                    batch_id=1,
+                    batch_id=batch_id,
                     uri=apply_uri_params(uri, uri_params),
                     feed_options=feed_options,
                     spider=spider,
@@ -636,6 +807,18 @@ class FeedExporter:
         else:
             logger.info("Stored %s", logmsg, extra={"spider": spider})
             self.crawler.stats.inc_value(f"feedexport/success_count/{slot_type}")
+            manifest = self.manifests.get(slot.uri_template)
+            if manifest is not None:
+                assert isinstance(slot.storage, FileFeedStorage)
+                try:
+                    manifest.commit(slot.storage, slot.batch_id, slot.itemcount)
+                except Exception:
+                    logger.exception(
+                        "Error committing %s to the feed manifest %s",
+                        logmsg,
+                        manifest.path,
+                        extra={"spider": spider},
+                    )
 
         await self.crawler.signals.send_catch_log_async(
             signals.feed_slot_closed, slot=slot
@@ -658,7 +841,22 @@ class FeedExporter:
         :param spider: user spider
         :param uri_template: template of uri which contains %(batch_time)s or %(batch_id)d to create new uri
         """
-        storage = self._get_storage(uri, feed_options)
+        manifest = self.manifests.get(uri_template)
+        if manifest is not None:
+            # Files of batches missing from the manifest are leftovers of an
+            # interrupted run, so the new batch must start from an empty
+            # file instead of appending to one.
+            storage = self._get_storage(uri, {**feed_options, "overwrite": True})
+            assert isinstance(storage, FileFeedStorage)
+            file = str(Path(storage.path).absolute())
+            if file in manifest.committed_files:
+                raise CloseSpider(
+                    f"batch {batch_id} of feed {uri_template!r} would "
+                    f"overwrite {file}, which is already committed in the "
+                    f"feed manifest {manifest.path}"
+                )
+        else:
+            storage = self._get_storage(uri, feed_options)
         return FeedSlot(
             storage=storage,
             uri=uri,

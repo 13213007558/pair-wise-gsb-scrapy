@@ -170,6 +170,7 @@ For example, with default settings, the job directory may look like this:
     |           ├── q{00000}
     |           └── info.json
     ├── requests.seen
+    ├── requests.seen.policy.json
     └── spider.state
 
 Where:
@@ -192,7 +193,10 @@ Where:
     the ``info.json`` and ``q{00000}`` files.
 
 -   :class:`~scrapy.dupefilters.RFPDupeFilter` creates the ``requests.seen``
-    file.
+    file and the ``requests.seen.policy.json`` file. The latter records the
+    request fingerprinting policy version and configuration summary, so that
+    resuming with a different policy fails instead of mixing incompatible
+    fingerprints.
 
 -   :class:`~scrapy.extensions.spiderstate.SpiderState` creates the
     ``spider.state`` file.

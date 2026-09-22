@@ -1,8 +1,9 @@
 from __future__ import annotations
 
+import json
 import logging
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 from warnings import warn
 
 from scrapy.exceptions import ScrapyDeprecationWarning
@@ -28,6 +29,7 @@ if TYPE_CHECKING:
 
 
 _SIZE_BYTES = 2
+_POLICY_FILE_NAME = "requests.seen.policy.json"
 
 
 def _read_fingerprints(data: bytes) -> Iterator[bytes]:
@@ -41,6 +43,68 @@ def _read_fingerprints(data: bytes) -> Iterator[bytes]:
             return
         yield fingerprint
         pos += size
+
+
+def _policy_differences(stored: Any, current: Any, path: str = "policy") -> list[str]:
+    if isinstance(stored, dict) and isinstance(current, dict):
+        differences = []
+        for key in sorted(stored.keys() | current.keys()):
+            if key not in stored:
+                differences.append(f"{path}.{key}: <missing> != {current[key]!r}")
+            elif key not in current:
+                differences.append(f"{path}.{key}: {stored[key]!r} != <missing>")
+            else:
+                differences.extend(
+                    _policy_differences(stored[key], current[key], f"{path}.{key}")
+                )
+        return differences
+    if stored != current:
+        return [f"{path}: {stored!r} != {current!r}"]
+    return []
+
+
+def _check_fingerprint_policy(path: str, policy: dict[str, Any] | None) -> None:
+    policy_path = Path(path, _POLICY_FILE_NAME)
+    if policy is None:
+        if policy_path.exists():
+            raise ValueError(
+                f"Cannot resume job in {path!r}: the current request "
+                "fingerprinter does not provide a fingerprint policy, but "
+                f"{policy_path} contains one"
+            )
+        return
+    if policy_path.exists():
+        try:
+            stored_policy = json.loads(policy_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise ValueError(
+                f"Cannot resume job in {path!r}: cannot read the request "
+                f"fingerprint policy from {policy_path}"
+            ) from exc
+        if stored_policy != policy:
+            differences = "; ".join(_policy_differences(stored_policy, policy))
+            raise ValueError(
+                f"Cannot resume job in {path!r}: the request fingerprint "
+                f"policy changed ({differences})"
+            )
+        return
+    seen_path = Path(path, "requests.seen")
+    if seen_path.exists():
+        legacy_policy = RequestFingerprinter()._fingerprint_policy
+        if (
+            policy["fingerprinter"] == legacy_policy["fingerprinter"]
+            and policy != legacy_policy
+        ):
+            differences = "; ".join(_policy_differences(legacy_policy, policy))
+            raise ValueError(
+                f"Cannot resume job in {path!r}: the request fingerprint "
+                "policy file is missing, the stored fingerprints are from "
+                f"the legacy default policy, and the current policy differs "
+                f"({differences})"
+            )
+    policy_path.write_text(
+        json.dumps(policy, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+    )
 
 
 class BaseDupeFilter:
@@ -87,6 +151,12 @@ class RFPDupeFilter(BaseDupeFilter):
     file named :file:`requests.seen` in the :ref:`job directory <job-dir>`,
     where each fingerprint is stored as its big-endian, 2-byte length followed
     by the fingerprint itself.
+
+    The request fingerprinting policy is tracked in a JSON file named
+    :file:`requests.seen.policy.json`. It contains the policy version and a
+    summary of the settings that affect request fingerprints. Resuming a job
+    with a different policy raises :exc:`ValueError` instead of reusing or
+    discarding the stored fingerprints.
     """
 
     def __init__(
@@ -115,6 +185,8 @@ class RFPDupeFilter(BaseDupeFilter):
                 stacklevel=2,
             )
         if path:
+            policy = getattr(self.fingerprinter, "_fingerprint_policy", None)
+            _check_fingerprint_policy(path, policy)
             self.file = Path(path, "requests.seen").open("a+b")
             self.file.seek(0)
             self._fingerprints.update(_read_fingerprints(self.file.read()))

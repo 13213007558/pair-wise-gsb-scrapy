@@ -331,6 +331,98 @@ import path.
 
 .. autoclass:: scrapy.utils.request.RequestFingerprinter
 
+The default request fingerprinter supports the following settings. These
+settings affect only fingerprint calculation; Scrapy sends the original
+request. With their default values, request fingerprints are the same as with
+the default :func:`~scrapy.utils.request.fingerprint` parameters.
+
+.. setting:: REQUEST_FINGERPRINTER_INCLUDE_HEADERS
+
+REQUEST_FINGERPRINTER_INCLUDE_HEADERS
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Default: ``[]``
+
+.. versionadded:: VERSION
+
+Request header names to include in request fingerprints. Header name matching
+is case-insensitive. Only listed headers affect request fingerprints;
+``Authorization`` and ``Cookie`` remain excluded unless listed.
+
+.. setting:: REQUEST_FINGERPRINTER_KEEP_QUERY_PARAMS
+
+REQUEST_FINGERPRINTER_KEEP_QUERY_PARAMS
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Default: ``None``
+
+.. versionadded:: VERSION
+
+Query parameter names to keep in request fingerprints. All other query
+parameters are excluded. Names are matched after percent-decoding. Repeated
+parameters and empty values are preserved, and the remaining parameters go
+through the usual URL canonicalization. This setting cannot be used together
+with :setting:`REQUEST_FINGERPRINTER_IGNORE_QUERY_PARAMS`.
+
+.. setting:: REQUEST_FINGERPRINTER_IGNORE_QUERY_PARAMS
+
+REQUEST_FINGERPRINTER_IGNORE_QUERY_PARAMS
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Default: ``None``
+
+.. versionadded:: VERSION
+
+Query parameter names to exclude from request fingerprints. Names are matched
+after percent-decoding. Repeated parameters and empty values in the remaining
+query string are preserved, and the remaining parameters go through the usual
+URL canonicalization. This setting cannot be used together with
+:setting:`REQUEST_FINGERPRINTER_KEEP_QUERY_PARAMS`.
+
+.. setting:: REQUEST_FINGERPRINTER_SCOPE
+
+REQUEST_FINGERPRINTER_SCOPE
+~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Default: ``None``
+
+.. versionadded:: VERSION
+
+A string or bytes value to add to every request fingerprint, for example to
+keep request identities separate per account. This setting cannot be used
+together with :setting:`REQUEST_FINGERPRINTER_SCOPE_META_KEY`. The job
+directory policy summary stores a SHA-256 digest of this value, not the value
+itself.
+
+.. setting:: REQUEST_FINGERPRINTER_SCOPE_META_KEY
+
+REQUEST_FINGERPRINTER_SCOPE_META_KEY
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Default: ``None``
+
+.. versionadded:: VERSION
+
+Name of the :attr:`request.meta <scrapy.Request.meta>` key that contains the
+request fingerprint scope. When this setting is used, every request must
+define a non-``None`` value for that key. Only that value affects the
+fingerprint; other request metadata does not. This setting cannot be used
+together with :setting:`REQUEST_FINGERPRINTER_SCOPE`. The job directory
+policy summary omits scope values.
+
+For example, to make tracking query parameters irrelevant while keeping
+request identities separate per account:
+
+.. code-block:: python
+
+    # settings.py
+    REQUEST_FINGERPRINTER_IGNORE_QUERY_PARAMS = ["utm_medium", "utm_source"]
+    REQUEST_FINGERPRINTER_SCOPE_META_KEY = "identity_scope"
+
+    # my_spider.py
+    async def start(self):
+        yield Request(url, meta={"identity_scope": account_id})
+
 .. _custom-request-fingerprinter:
 
 Writing your own request fingerprinter

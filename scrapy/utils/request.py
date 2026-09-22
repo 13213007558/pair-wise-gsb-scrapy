@@ -8,8 +8,9 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import re
 from typing import TYPE_CHECKING, Any, Protocol
-from urllib.parse import urlunparse
+from urllib.parse import SplitResult, unquote_plus, urlsplit, urlunparse, urlunsplit
 from weakref import WeakKeyDictionary
 
 from w3lib.url import canonicalize_url
@@ -17,7 +18,7 @@ from w3lib.url import canonicalize_url
 from scrapy import Request, Spider
 from scrapy.utils.httpobj import urlparse_cached
 from scrapy.utils.misc import load_object
-from scrapy.utils.python import to_bytes, to_unicode
+from scrapy.utils.python import global_object_name, to_bytes, to_unicode
 
 if TYPE_CHECKING:
     from collections.abc import Iterable
@@ -32,8 +33,64 @@ logger = logging.getLogger(__name__)
 
 
 _fingerprint_cache: WeakKeyDictionary[
-    Request, dict[tuple[tuple[bytes, ...] | None, bool, bool], bytes]
+    Request,
+    dict[
+        tuple[
+            tuple[bytes, ...] | None,
+            bool,
+            bool,
+            tuple[str, ...] | None,
+            tuple[str, ...] | None,
+            bytes | None,
+        ],
+        bytes,
+    ],
 ] = WeakKeyDictionary()
+
+
+_FINGERPRINT_POLICY_VERSION = 1
+
+
+def _decode_query_param_name(query_part: str) -> str:
+    return unquote_plus(query_part.split("=", 1)[0])
+
+
+def _filter_query_params(
+    url: str,
+    *,
+    keep_query_params: tuple[str, ...] | None,
+    ignore_query_params: tuple[str, ...] | None,
+) -> str:
+    if keep_query_params is None and ignore_query_params is None:
+        return url
+    parts: SplitResult = urlsplit(url)
+    query_tokens = re.split(r"([;&])", parts.query)
+    query_parts = query_tokens[::2]
+    separators = [None, *query_tokens[1::2]]
+    if keep_query_params is not None:
+        keep = set(keep_query_params)
+        kept_parts = [
+            (part, separator)
+            for part, separator in zip(query_parts, separators, strict=True)
+            if _decode_query_param_name(part) in keep
+        ]
+    else:
+        assert ignore_query_params is not None
+        ignore = set(ignore_query_params)
+        kept_parts = [
+            (part, separator)
+            for part, separator in zip(query_parts, separators, strict=True)
+            if _decode_query_param_name(part) not in ignore
+        ]
+    if kept_parts:
+        query = kept_parts[0][0] + "".join(
+            f"{separator}{part}" for part, separator in kept_parts[1:]
+        )
+    else:
+        query = ""
+    return str(
+        urlunsplit((parts.scheme, parts.netloc, parts.path, query, parts.fragment))
+    )
 
 
 def fingerprint(
@@ -41,9 +98,16 @@ def fingerprint(
     *,
     include_headers: Iterable[bytes | str] | None = None,
     keep_fragments: bool = False,
+    keep_query_params: Iterable[bytes | str] | None = None,
+    ignore_query_params: Iterable[bytes | str] | None = None,
+    scope: bytes | str | None = None,
 ) -> bytes:
     """
     Return the request fingerprint.
+
+    .. versionchanged:: VERSION
+        Added the *keep_query_params*, *ignore_query_params* and *scope*
+        parameters.
 
     The request fingerprint is a hash that uniquely identifies the resource the
     request points to. For example, take the following two urls:
@@ -73,16 +137,47 @@ def fingerprint(
     keep_fragments is not a substitute for rendering JavaScript to reach
     content loaded based on the URL fragment; see
     :ref:`topics-dynamic-content` for that instead.
+
+    Use *keep_query_params* to fingerprint only the listed query parameters,
+    or *ignore_query_params* to exclude the listed query parameters. Only one
+    of these parameters can be used. Query parameter names are matched after
+    percent-decoding, while repeated parameters, empty values and the usual
+    canonicalization order are preserved.
+
+    Use *scope* to add a caller-provided identity scope, such as an account
+    identifier, to the fingerprint.
     """
+    if keep_query_params is not None and ignore_query_params is not None:
+        raise ValueError(
+            "keep_query_params and ignore_query_params cannot be used together"
+        )
     processed_include_headers: tuple[bytes, ...] | None = None
     if include_headers:
         processed_include_headers = tuple(
             to_bytes(h.lower()) for h in sorted(include_headers)
         )
+    processed_keep_query_params: tuple[str, ...] | None = None
+    if keep_query_params is not None:
+        processed_keep_query_params = tuple(
+            sorted(to_unicode(param) for param in keep_query_params)
+        )
+    processed_ignore_query_params: tuple[str, ...] | None = None
+    if ignore_query_params is not None:
+        processed_ignore_query_params = tuple(
+            sorted(to_unicode(param) for param in ignore_query_params)
+        )
+    processed_scope = to_bytes(scope) if scope is not None else None
     verbatim_url = bool(request.meta.get("verbatim_url"))
     effective_keep_fragments = keep_fragments and not verbatim_url
     cache = _fingerprint_cache.setdefault(request, {})
-    cache_key = (processed_include_headers, effective_keep_fragments, verbatim_url)
+    cache_key = (
+        processed_include_headers,
+        effective_keep_fragments,
+        verbatim_url,
+        processed_keep_query_params,
+        processed_ignore_query_params,
+        processed_scope,
+    )
     if cache_key not in cache:
         # To decode bytes reliably (JSON does not support bytes), regardless of
         # character encoding, we use bytes.hex()
@@ -94,16 +189,21 @@ def fingerprint(
                         header_value.hex()
                         for header_value in request.headers.getlist(header)
                     ]
-        if verbatim_url:
-            url = request.url
-        else:
-            url = canonicalize_url(request.url, keep_fragments=keep_fragments)
+        url = _filter_query_params(
+            request.url,
+            keep_query_params=processed_keep_query_params,
+            ignore_query_params=processed_ignore_query_params,
+        )
+        if not verbatim_url:
+            url = canonicalize_url(url, keep_fragments=keep_fragments)
         fingerprint_data = {
             "method": to_unicode(request.method),
             "url": url,
             "body": (request.body or b"").hex(),
             "headers": headers,
         }
+        if processed_scope is not None:
+            fingerprint_data["scope"] = processed_scope.hex()
         fingerprint_json = json.dumps(fingerprint_data, sort_keys=True)
         cache[cache_key] = hashlib.sha1(  # noqa: S324
             fingerprint_json.encode()
@@ -117,6 +217,10 @@ class RequestFingerprinterProtocol(Protocol):
 
 class RequestFingerprinter:
     """Default fingerprinter.
+
+    .. versionchanged:: VERSION
+        Added support for the request fingerprinting settings documented in
+        :ref:`request-fingerprints`.
 
     It takes into account a canonical version
     (:func:`w3lib.url.canonicalize_url`) of :attr:`request.url
@@ -132,10 +236,89 @@ class RequestFingerprinter:
         return cls(crawler)
 
     def __init__(self, crawler: Crawler | None = None):
-        self._fingerprint = fingerprint
+        self._include_headers: list[bytes | str] = []
+        self._keep_query_params: list[bytes | str] | None = None
+        self._ignore_query_params: list[bytes | str] | None = None
+        self._scope: bytes | str | None = None
+        self._scope_meta_key: str | None = None
+        if crawler is not None:
+            settings = crawler.settings
+            self._include_headers = settings.getlist(
+                "REQUEST_FINGERPRINTER_INCLUDE_HEADERS"
+            )
+            keep_query_params = settings["REQUEST_FINGERPRINTER_KEEP_QUERY_PARAMS"]
+            if keep_query_params is not None:
+                self._keep_query_params = settings.getlist(
+                    "REQUEST_FINGERPRINTER_KEEP_QUERY_PARAMS"
+                )
+            ignore_query_params = settings["REQUEST_FINGERPRINTER_IGNORE_QUERY_PARAMS"]
+            if ignore_query_params is not None:
+                self._ignore_query_params = settings.getlist(
+                    "REQUEST_FINGERPRINTER_IGNORE_QUERY_PARAMS"
+                )
+            if (
+                self._keep_query_params is not None
+                and self._ignore_query_params is not None
+            ):
+                raise ValueError(
+                    "REQUEST_FINGERPRINTER_KEEP_QUERY_PARAMS and "
+                    "REQUEST_FINGERPRINTER_IGNORE_QUERY_PARAMS cannot be used "
+                    "together"
+                )
+            self._scope = settings["REQUEST_FINGERPRINTER_SCOPE"]
+            self._scope_meta_key = settings["REQUEST_FINGERPRINTER_SCOPE_META_KEY"]
+            if self._scope is not None and self._scope_meta_key is not None:
+                raise ValueError(
+                    "REQUEST_FINGERPRINTER_SCOPE and "
+                    "REQUEST_FINGERPRINTER_SCOPE_META_KEY cannot be used together"
+                )
 
     def fingerprint(self, request: Request) -> bytes:
-        return self._fingerprint(request)
+        scope = self._scope
+        if self._scope_meta_key is not None:
+            if (
+                self._scope_meta_key not in request.meta
+                or request.meta[self._scope_meta_key] is None
+            ):
+                raise ValueError(
+                    f"Request {request!r} does not define the "
+                    f"{self._scope_meta_key!r} meta key required by "
+                    "REQUEST_FINGERPRINTER_SCOPE_META_KEY"
+                )
+            scope = request.meta[self._scope_meta_key]
+        return fingerprint(
+            request,
+            include_headers=self._include_headers,
+            keep_query_params=self._keep_query_params,
+            ignore_query_params=self._ignore_query_params,
+            scope=scope,
+        )
+
+    @property
+    def _fingerprint_policy(self) -> dict[str, Any]:
+        """Return the request fingerprinting policy, for job directories."""
+        scope_digest = None
+        if self._scope is not None:
+            scope_digest = hashlib.sha256(to_bytes(self._scope)).hexdigest()
+        return {
+            "version": _FINGERPRINT_POLICY_VERSION,
+            "fingerprinter": global_object_name(type(self)),
+            "include_headers": sorted(
+                to_unicode(to_bytes(header).lower()) for header in self._include_headers
+            ),
+            "keep_query_params": (
+                None
+                if self._keep_query_params is None
+                else sorted(to_unicode(param) for param in self._keep_query_params)
+            ),
+            "ignore_query_params": (
+                None
+                if self._ignore_query_params is None
+                else sorted(to_unicode(param) for param in self._ignore_query_params)
+            ),
+            "scope_meta_key": self._scope_meta_key,
+            "scope_setting_sha256": scope_digest,
+        }
 
 
 def request_httprepr(request: Request) -> bytes:

@@ -4,7 +4,7 @@ import gzip
 import json
 import random
 from typing import TYPE_CHECKING, Any, ClassVar, ParamSpec, TypeVar, cast
-from urllib.parse import urlencode
+from urllib.parse import parse_qsl, urlencode, urlsplit
 
 from twisted.internet.task import deferLater
 from twisted.web import resource, server
@@ -281,6 +281,26 @@ class Echo(LeafResource):
         return to_bytes(json.dumps(output))
 
     render_POST = render_GET
+
+
+class FormEcho(LeafResource):
+    """Echo the method, URL and form parameters of the request.
+
+    Parameters are an ordered list of name-value pairs, decoded from the
+    query string for GET requests and from the body for POST requests.
+    """
+
+    def render(self, request: Request) -> bytes:
+        assert request.content
+        data = urlsplit(request.uri).query
+        if request.method == b"POST":
+            data = request.content.read()
+        output = {
+            "method": to_unicode(request.method),
+            "url": to_unicode(request.uri),
+            "params": parse_qsl(to_unicode(data), keep_blank_values=True),
+        }
+        return to_bytes(json.dumps(output))
 
 
 class RedirectTo(LeafResource):

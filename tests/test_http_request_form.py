@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import re
 import warnings
 from typing import TYPE_CHECKING, Any
@@ -8,13 +9,18 @@ from urllib.parse import parse_qs, unquote_to_bytes
 import pytest
 
 from scrapy.exceptions import ScrapyDeprecationWarning
-from scrapy.http import FormRequest, HtmlResponse
+from scrapy.http import FormRequest, HtmlResponse, Request, Response, TextResponse
 from scrapy.utils.httpobj import urlparse_cached
 from scrapy.utils.python import to_unicode
+from scrapy.utils.test import get_crawler
+from tests.spiders import RawResponseSpider
 from tests.utils.bases.http_request import TestRequestBase
+from tests.utils.decorators import coroutine_test
 
 if TYPE_CHECKING:
-    from scrapy import Request
+    from collections.abc import AsyncIterator, Iterator
+
+    from tests.mockserver.http import MockServer
 
 
 def _buildresponse(body: bytes | str, **kwargs: Any) -> HtmlResponse:
@@ -1068,3 +1074,279 @@ class TestFormRequest(TestRequestBase):
 
         with pytest.raises(ValueError, match="No <form> element found with"):
             FormRequest.from_response(response, formxpath='//div[@id="outside-form"]/p')
+
+    def test_from_response_form_attribute_owner(self):
+        response = _buildresponse(
+            """<input form="search" name="before" value="b1">
+            <input name="stray" value="x">
+            <input form="nonexistent" name="orphan" value="x">
+            <form id="search" action="/search" method="GET">
+                <input type="hidden" name="inside" value="i1">
+                <input form="other" name="reassigned" value="r1">
+            </form>
+            <input form="search" name="after" value="a1">
+            <form id="other">
+                <input name="other-field" value="o1">
+            </form>""",
+            url="http://www.example.com/page",
+        )
+        req = self.request_class.from_response(
+            response, formid="search", dont_click=True
+        )
+        assert urlparse_cached(req).query == "before=b1&inside=i1&after=a1"
+
+    def test_from_response_clicked_button_formaction_formmethod(self):
+        response = _buildresponse(
+            """<form id="search" action="/old" method="POST">
+                <input type="hidden" name="q" value="book">
+                <button type="submit" name="go" value="inside">Search</button>
+            </form>
+            <button form="search" type="submit" name="go" value="outside"
+                    formaction="/new" formmethod="GET">Search</button>""",
+            url="http://www.example.com/page",
+        )
+        # the first submit button in document order is used by default
+        req = self.request_class.from_response(response, formid="search")
+        assert req.method == "POST"
+        assert req.url == "http://www.example.com/old"
+        # the clicked button overrides the form action and method
+        req = self.request_class.from_response(
+            response, formid="search", clickdata={"value": "outside"}
+        )
+        assert req.method == "GET"
+        assert urlparse_cached(req).path == "/new"
+        assert urlparse_cached(req).query == "q=book&go=outside"
+        # explicit url and method win over the clicked button attributes
+        req = self.request_class.from_response(
+            response,
+            formid="search",
+            clickdata={"value": "outside"},
+            url="/explicit",
+            method="POST",
+        )
+        assert req.method == "POST"
+        assert req.url == "http://www.example.com/explicit"
+
+    def test_from_response_disabled_controls(self):
+        response = _buildresponse(
+            """<form action="/search" method="GET">
+                <input name="disabled-input" value="x" disabled>
+                <fieldset disabled>
+                    <input name="disabled-fieldset" value="x">
+                    <legend><input name="legend" value="l1"></legend>
+                </fieldset>
+                <fieldset disabled>
+                    <input name="disabled-no-legend" value="x">
+                </fieldset>
+                <button type="submit" name="disabled-submit" value="x" disabled>Go</button>
+                <button type="submit" name="go" value="1">Go</button>
+            </form>"""
+        )
+        req = self.request_class.from_response(response)
+        assert urlparse_cached(req).query == "legend=l1&go=1"
+
+    def test_from_response_select_disabled_options(self):
+        response = _buildresponse(
+            """<form action="/search" method="GET">
+                <select name="single">
+                    <option value="s1">s1</option>
+                    <optgroup disabled>
+                        <option value="s2" selected>s2</option>
+                    </optgroup>
+                    <option value="s3" selected>s3</option>
+                </select>
+                <select name="multi" multiple>
+                    <option value="m1" selected>m1</option>
+                    <option value="m2" selected disabled>m2</option>
+                    <optgroup disabled>
+                        <option value="m3" selected>m3</option>
+                    </optgroup>
+                    <option value="m4" selected>m4</option>
+                </select>
+                <select name="disabled-selected">
+                    <option value="x" selected disabled>x</option>
+                </select>
+                <select name="all-disabled">
+                    <option value="x" disabled>x</option>
+                </select>
+                <select name="textvalue">
+                    <option>Text Value</option>
+                </select>
+            </form>"""
+        )
+        req = self.request_class.from_response(response, dont_click=True)
+        assert (
+            urlparse_cached(req).query == "single=s3&multi=m1&multi=m4"
+            "&textvalue=Text+Value"
+        )
+
+
+FORM_PAGE = """\
+<html>
+<body>
+<input form="search" name="before" value="b1">
+<input name="stray" value="x">
+<input form="nonexistent" name="orphan" value="x">
+<form id="search" action="/form-echo" method="POST">
+    <input type="hidden" name="dup" value="d1">
+    <input type="hidden" name="dup" value="d2">
+    <input form="other" name="reassigned" value="r1">
+    <fieldset disabled>
+        <input name="disabled-fieldset" value="x">
+        <legend><input name="legend" value="l1"></legend>
+    </fieldset>
+    <fieldset disabled>
+        <input name="disabled-no-legend" value="x">
+    </fieldset>
+    <input name="disabled-input" value="x" disabled>
+    <select name="single">
+        <option value="s1">s1</option>
+        <optgroup disabled>
+            <option value="s2" selected>s2</option>
+        </optgroup>
+        <option value="s3" selected>s3</option>
+    </select>
+    <select name="multi" multiple>
+        <option value="m1" selected>m1</option>
+        <option value="m2" selected disabled>m2</option>
+        <optgroup disabled>
+            <option value="m3" selected>m3</option>
+        </optgroup>
+        <option value="m4" selected>m4</option>
+    </select>
+    <select name="disabled-selected">
+        <option value="x" selected disabled>x</option>
+    </select>
+    <select name="all-disabled">
+        <option value="x" disabled>x</option>
+    </select>
+    <select name="textvalue">
+        <option>Text Value</option>
+    </select>
+    <button type="button" name="btn" value="x">Button</button>
+    <button type="submit" name="disabled-submit" value="x" disabled>Disabled</button>
+    <button type="submit" name="go" value="inside">Search</button>
+</form>
+<input form="search" name="after" value="a1">
+<button form="search" name="go" value="outside" formaction="/form-echo-alt" formmethod="GET">Search</button>
+<form id="other" action="/form-echo">
+    <input name="other-field" value="o1">
+</form>
+</body>
+</html>
+"""
+
+
+class FormSubmissionSpider(RawResponseSpider):
+    """Submit the FORM_PAGE form and record what the mock server receives."""
+
+    name = "form_submission"
+    content_type = "text/html"
+
+    def __init__(
+        self,
+        *args: Any,
+        from_response_kwargs: dict[str, Any] | None = None,
+        **kwargs: Any,
+    ) -> None:
+        super().__init__(*args, **kwargs)
+        self.from_response_kwargs = from_response_kwargs or {}
+        self.echo: dict[str, Any] = {}
+
+    def raw_body(self) -> str:
+        return FORM_PAGE
+
+    async def start(self) -> AsyncIterator[Request]:
+        yield Request(self.raw_url, callback=self.parse_form)
+
+    def parse_form(self, response: Response) -> Iterator[Request]:
+        assert isinstance(response, TextResponse)
+        yield FormRequest.from_response(
+            response,
+            formid="search",
+            callback=self.parse_echo,
+            **self.from_response_kwargs,
+        )
+
+    def parse_echo(self, response: Response) -> None:
+        assert isinstance(response, TextResponse)
+        self.echo = json.loads(response.text)
+
+
+# FormRequest.from_response() is deprecated in favor of form2request, so the
+# tests below ignore the resulting deprecation warning.
+@pytest.mark.filterwarnings("ignore::scrapy.exceptions.ScrapyDeprecationWarning")
+class TestFormRequestFromResponseSubmission:
+    """Submit a form with FormRequest.from_response() against the mock server
+    and check the method, URL and parameters that it receives."""
+
+    async def _submit(
+        self, mockserver: MockServer, **from_response_kwargs: Any
+    ) -> dict[str, Any]:
+        crawler = get_crawler(FormSubmissionSpider)
+        await crawler.crawl_async(
+            mockserver=mockserver, from_response_kwargs=from_response_kwargs
+        )
+        assert isinstance(crawler.spider, FormSubmissionSpider)
+        return crawler.spider.echo
+
+    @coroutine_test
+    async def test_successful_controls(self, mockserver: MockServer) -> None:
+        echo = await self._submit(mockserver)
+        assert echo["method"] == "POST"
+        assert echo["url"] == "/form-echo"
+        assert echo["params"] == [
+            ["before", "b1"],
+            ["dup", "d1"],
+            ["dup", "d2"],
+            ["legend", "l1"],
+            ["single", "s3"],
+            ["multi", "m1"],
+            ["multi", "m4"],
+            ["textvalue", "Text Value"],
+            ["go", "inside"],
+            ["after", "a1"],
+        ]
+
+    @coroutine_test
+    async def test_clicked_button_formaction_formmethod(
+        self, mockserver: MockServer
+    ) -> None:
+        echo = await self._submit(mockserver, clickdata={"value": "outside"})
+        assert echo["method"] == "GET"
+        assert echo["url"].startswith("/form-echo-alt?")
+        assert echo["params"] == [
+            ["before", "b1"],
+            ["dup", "d1"],
+            ["dup", "d2"],
+            ["legend", "l1"],
+            ["single", "s3"],
+            ["multi", "m1"],
+            ["multi", "m4"],
+            ["textvalue", "Text Value"],
+            ["after", "a1"],
+            ["go", "outside"],
+        ]
+
+    @coroutine_test
+    async def test_explicit_overrides(self, mockserver: MockServer) -> None:
+        echo = await self._submit(
+            mockserver,
+            url=mockserver.url("/form-echo"),
+            method="GET",
+            formdata={"dup": "override", "extra": "e1"},
+            dont_click=True,
+        )
+        assert echo["method"] == "GET"
+        assert echo["url"].startswith("/form-echo?")
+        assert echo["params"] == [
+            ["before", "b1"],
+            ["legend", "l1"],
+            ["single", "s3"],
+            ["multi", "m1"],
+            ["multi", "m4"],
+            ["textvalue", "Text Value"],
+            ["after", "a1"],
+            ["dup", "override"],
+            ["extra", "e1"],
+        ]

@@ -27,6 +27,7 @@ from .http_resources import (
     EmptyContentTypeHeaderResource,
     Follow,
     ForeverTakingResource,
+    FormEcho,
     H2DataAndReset,
     H2GoAway,
     H2NoSupport,
@@ -63,6 +64,8 @@ class Root(BaseResource):
         put_child(self, b"raw", Raw())
         put_child(self, b"bad-header", BadHeader())
         put_child(self, b"echo", Echo())
+        put_child(self, b"form-echo", FormEcho())
+        put_child(self, b"form-echo-alt", FormEcho())
         put_child(self, b"payload", PayloadResource())
         put_child(self, b"alpayload", ArbitraryLengthPayloadResource())
         put_child(self, b"static", File(str(Path(tests_datadir, "test_site/"))))

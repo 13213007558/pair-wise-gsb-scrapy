@@ -10,7 +10,7 @@ from typing import TYPE_CHECKING, Any, cast
 import pytest
 
 from scrapy.core.scheduler import Scheduler
-from scrapy.dupefilters import BaseDupeFilter, RFPDupeFilter
+from scrapy.dupefilters import BaseDupeFilter, MinDepthRFPDupeFilter, RFPDupeFilter
 from scrapy.exceptions import ScrapyDeprecationWarning
 from scrapy.http import Request
 from scrapy.utils.misc import build_from_crawler
@@ -274,3 +274,140 @@ class TestBaseDupeFilter:
             match=r"Calling BaseDupeFilter\.log\(\) is deprecated.",
         ):
             dupefilter.log(None, None)  # type: ignore[arg-type]
+
+
+def _get_min_depth_dupefilter(
+    *,
+    settings: dict[str, Any] | None = None,
+    open_: bool = True,
+) -> MinDepthRFPDupeFilter:
+    settings = {**(settings or {}), "DUPEFILTER_CLASS": MinDepthRFPDupeFilter}
+    dupefilter = _get_dupefilter(settings=settings, open_=open_)
+    assert isinstance(dupefilter, MinDepthRFPDupeFilter)
+    return dupefilter
+
+
+class TestMinDepthRFPDupeFilter:
+    def test_from_crawler_scheduler(self):
+        settings = {"DUPEFILTER_CLASS": MinDepthRFPDupeFilter}
+        crawler = get_crawler(settings_dict=settings)
+        scheduler = build_from_crawler(Scheduler, crawler)
+        assert isinstance(scheduler.df, MinDepthRFPDupeFilter)
+
+    def test_same_depth_filtered(self):
+        dupefilter = _get_min_depth_dupefilter()
+        r1 = Request("https://example.com/1", meta={"depth": 1})
+        r2 = Request("https://example.com/1", meta={"depth": 1})
+
+        assert not dupefilter.request_seen(r1)
+        assert dupefilter.request_seen(r2)
+
+        dupefilter.close("finished")
+
+    def test_shallower_request_goes_through(self):
+        dupefilter = _get_min_depth_dupefilter()
+        r2 = Request("https://example.com/1", meta={"depth": 2})
+        r1 = Request("https://example.com/1", meta={"depth": 1})
+
+        assert not dupefilter.request_seen(r2)
+        assert not dupefilter.request_seen(r1)
+        # The lowest known depth is now 1.
+        assert dupefilter.request_seen(r1)
+        assert dupefilter.request_seen(r2)
+
+        dupefilter.close("finished")
+
+    def test_deeper_request_does_not_overwrite_known_minimum(self):
+        dupefilter = _get_min_depth_dupefilter()
+        r1 = Request("https://example.com/1", meta={"depth": 1})
+        r3 = Request("https://example.com/1", meta={"depth": 3})
+        r0 = Request("https://example.com/1", meta={"depth": 0})
+
+        assert not dupefilter.request_seen(r1)
+        assert dupefilter.request_seen(r3)
+        # The lowest known depth is still 1.
+        assert dupefilter.request_seen(r1)
+        assert not dupefilter.request_seen(r0)
+
+        dupefilter.close("finished")
+
+    def test_missing_depth_is_zero(self):
+        dupefilter = _get_min_depth_dupefilter()
+        r0 = Request("https://example.com/1")
+        r1 = Request("https://example.com/1", meta={"depth": 1})
+
+        assert not dupefilter.request_seen(r0)
+        assert dupefilter.request_seen(r0)
+        assert dupefilter.request_seen(r1)
+
+        dupefilter.close("finished")
+
+    def test_jobdir(self):
+        r2 = Request("https://example.com/1", meta={"depth": 2})
+        r1 = Request("https://example.com/1", meta={"depth": 1})
+        r0 = Request("https://example.com/1", meta={"depth": 0})
+
+        path = tempfile.mkdtemp()
+        try:
+            df = _get_min_depth_dupefilter(settings={"JOBDIR": path}, open_=False)
+            try:
+                df.open()
+                assert not df.request_seen(r2)
+                assert not df.request_seen(r1)
+            finally:
+                df.close("finished")
+
+            df2 = _get_min_depth_dupefilter(settings={"JOBDIR": path}, open_=False)
+            assert df is not df2
+            try:
+                df2.open()
+                # The lowest known depth, 1, is kept across jobs.
+                assert df2.request_seen(r2)
+                assert df2.request_seen(r1)
+                assert not df2.request_seen(r0)
+            finally:
+                df2.close("finished")
+        finally:
+            shutil.rmtree(path)
+
+    def test_jobdir_truncated(self):
+        r1 = Request("https://example.com/1", meta={"depth": 1})
+        r2 = Request("https://example.com/2", meta={"depth": 1})
+
+        path = tempfile.mkdtemp()
+        try:
+            df = _get_min_depth_dupefilter(settings={"JOBDIR": path}, open_=False)
+            try:
+                df.open()
+                df.request_seen(r1)
+                df.request_seen(r2)
+            finally:
+                df.close("finished")
+
+            seen_file = Path(path, "requests.seen")
+            seen_file.write_bytes(seen_file.read_bytes()[:-1])
+
+            df2 = _get_min_depth_dupefilter(settings={"JOBDIR": path}, open_=False)
+            try:
+                df2.open()
+                assert df2.request_seen(r1)
+                assert not df2.request_seen(r2)
+            finally:
+                df2.close("finished")
+        finally:
+            shutil.rmtree(path)
+
+    def test_jobdir_legacy_format(self):
+        path = tempfile.mkdtemp()
+        try:
+            df = _get_dupefilter(settings={"JOBDIR": path}, open_=False)
+            try:
+                df.open()
+                df.request_seen(Request("https://example.com/1"))
+            finally:
+                df.close("finished")
+
+            with pytest.raises(ValueError, match="requests.seen"):
+                _get_min_depth_dupefilter(settings={"JOBDIR": path}, open_=False)
+        finally:
+            shutil.rmtree(path)

@@ -702,6 +702,8 @@ Scope: ``scrapy.spidermiddlewares.depth.DepthMiddleware``
 The maximum depth that will be allowed to crawl for any site. If zero, no limit
 will be imposed.
 
+.. seealso:: :class:`~scrapy.dupefilters.MinDepthRFPDupeFilter`
+
 .. setting:: DEPTH_PRIORITY
 
 DEPTH_PRIORITY
@@ -1327,6 +1329,15 @@ requests may cause crawling loops. It is usually better to set
 the ``dont_filter`` parameter to ``True`` on the ``__init__`` method of a
 specific :class:`~scrapy.Request` object that should not be filtered out.
 
+When using :setting:`DEPTH_LIMIT`, you may want to set
+:setting:`DUPEFILTER_CLASS` to
+:class:`~scrapy.dupefilters.MinDepthRFPDupeFilter` instead. It tracks the
+lowest :reqmeta:`depth` at which each request has been seen and, when a
+request is found at a lower depth, schedules it again instead of filtering
+it out, so that its follow-up requests are computed from that lower depth.
+Note that this means that some requests may be downloaded and processed
+more than once.
+
 A class assigned to :setting:`DUPEFILTER_CLASS` must implement the following
 interface:
 
@@ -1369,6 +1380,8 @@ interface:
 .. autoclass:: scrapy.dupefilters.BaseDupeFilter
 
 .. autoclass:: scrapy.dupefilters.RFPDupeFilter
+
+.. autoclass:: scrapy.dupefilters.MinDepthRFPDupeFilter
 
 
 .. setting:: DUPEFILTER_DEBUG

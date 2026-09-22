@@ -191,8 +191,9 @@ Where:
     :class:`dict` representations of :class:`scrapy.Request` objects, creates
     the ``info.json`` and ``q{00000}`` files.
 
--   :class:`~scrapy.dupefilters.RFPDupeFilter` creates the ``requests.seen``
-    file.
+-   :class:`~scrapy.dupefilters.RFPDupeFilter` and
+    :class:`~scrapy.dupefilters.MinDepthRFPDupeFilter` create the
+    ``requests.seen`` file.
 
 -   :class:`~scrapy.extensions.spiderstate.SpiderState` creates the
     ``spider.state`` file.

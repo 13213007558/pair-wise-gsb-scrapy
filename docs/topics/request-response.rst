@@ -331,6 +331,76 @@ import path.
 
 .. autoclass:: scrapy.utils.request.RequestFingerprinter
 
+.. setting:: REQUEST_FINGERPRINT_INCLUDE_HEADERS
+
+REQUEST_FINGERPRINT_INCLUDE_HEADERS
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+.. versionadded:: VERSION
+
+Default: ``[]``
+
+A list of request header names whose values take part in the request
+fingerprint, in addition to the URL, method and body. Header names are
+matched case-insensitively.
+
+.. setting:: REQUEST_FINGERPRINT_IGNORE_QUERY_PARAMS
+
+REQUEST_FINGERPRINT_IGNORE_QUERY_PARAMS
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+.. versionadded:: VERSION
+
+Default: ``[]``
+
+A list of URL query parameter names to exclude from the request
+fingerprint, for example tracking parameters. Parameter names are matched
+after percent-decoding; repeated parameters and empty values of the
+remaining parameters are preserved. The request itself is sent unmodified.
+
+When both this setting and :setting:`REQUEST_FINGERPRINT_KEEP_QUERY_PARAMS`
+are set, parameters are first restricted to the keep list, and then the
+ignore list is applied.
+
+.. setting:: REQUEST_FINGERPRINT_KEEP_QUERY_PARAMS
+
+REQUEST_FINGERPRINT_KEEP_QUERY_PARAMS
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+.. versionadded:: VERSION
+
+Default: ``[]``
+
+A list of URL query parameter names. When not empty, only these parameters
+take part in the request fingerprint. Parameter names are matched after
+percent-decoding; repeated parameters and empty values are preserved. The
+request itself is sent unmodified.
+
+See :setting:`REQUEST_FINGERPRINT_IGNORE_QUERY_PARAMS` to exclude specific
+parameters instead.
+
+.. setting:: REQUEST_FINGERPRINT_SCOPE
+
+REQUEST_FINGERPRINT_SCOPE
+~~~~~~~~~~~~~~~~~~~~~~~~~
+
+.. versionadded:: VERSION
+
+Default: ``None``
+
+A string that takes part in the request fingerprint, to tell apart
+requests that are otherwise equivalent, for example requests made on
+behalf of different accounts. Use the :reqmeta:`fingerprint_scope` request
+meta key to override it per request.
+
+The scope is only used as given; cookies, the ``Authorization`` header or
+other request data are never automatically included in the fingerprint.
+
+When using :setting:`JOBDIR`, the request identity policy (its version
+and the configuration described above) is recorded in the job directory.
+Resuming the job with a different policy raises an error instead of
+mixing fingerprints computed with different policies.
+
 .. _custom-request-fingerprinter:
 
 Writing your own request fingerprinter
@@ -846,6 +916,7 @@ Those are:
 * :reqmeta:`download_timeout`
 * :reqmeta:`download_warnsize`
 * :reqmeta:`ftp_local_filename`
+* :reqmeta:`fingerprint_scope`
 * :reqmeta:`ftp_passive`
 * :reqmeta:`ftp_password`
 * :reqmeta:`ftp_user`
@@ -995,6 +1066,17 @@ max_retry_times
 The meta key is used set retry times per request. When set, the
 :reqmeta:`max_retry_times` meta key takes higher precedence over the
 :setting:`RETRY_TIMES` setting.
+
+.. reqmeta:: fingerprint_scope
+
+fingerprint_scope
+-----------------
+
+.. versionadded:: VERSION
+
+A string that takes part in the request fingerprint, overriding the
+:setting:`REQUEST_FINGERPRINT_SCOPE` setting for this request. See
+:ref:`request-fingerprints`.
 
 .. reqmeta:: verbatim_url
 

@@ -51,6 +51,7 @@ from tests.spiders import (
     CrawlSpiderWithProcessRequestCallbackKeywordArguments,
     DelaySpider,
     DuplicateStartSpider,
+    FingerprintScopeSpider,
     FollowAllSpider,
     HeadersReceivedCallbackSpider,
     HeadersReceivedErrbackSpider,
@@ -73,6 +74,67 @@ class TestCrawl:
         await crawler.crawl_async(mockserver=mockserver)
         assert isinstance(crawler.spider, FollowAllSpider)
         assert len(crawler.spider.urls_visited) == 11  # 10 + start_url
+
+    @coroutine_test
+    async def test_fingerprint_identity_policy(
+        self, mockserver: MockServer, tmp_path
+    ) -> None:
+        jobdir = tmp_path / "jobdir"
+        settings = {
+            "JOBDIR": str(jobdir),
+            "REQUEST_FINGERPRINT_IGNORE_QUERY_PARAMS": ["utm_source"],
+        }
+        base_url = mockserver.url("/uri") + "?id=1&tag=a&tag=b&empty=&utm_source="
+        crawl_kwargs = {
+            "urls": [base_url + "x", base_url + "y"],
+            "accounts": ["alice", "bob"],
+            "mockserver": mockserver,
+        }
+
+        crawler = get_crawler(FingerprintScopeSpider, settings)
+        await crawler.crawl_async(**crawl_kwargs)
+        spider = crawler.spider
+        assert isinstance(spider, FingerprintScopeSpider)
+        # the second URL of each account only differs in the ignored
+        # tracking parameter, so it is filtered; the same URL is a
+        # different request for a different account
+        assert crawler.stats.get_value("dupefilter/filtered") == 2
+        assert set(spider.received_uris) == {"alice", "bob"}
+        # the URLs actually sent keep the tracking parameters untouched
+        for uris in spider.received_uris.values():
+            (uri,) = uris
+            assert "utm_source=x" in uri
+            assert "tag=a&tag=b" in uri
+            assert "empty=" in uri
+
+        # the job directory records the identity policy, and no file in it
+        # contains an account name in clear text
+        policy = json.loads(
+            (jobdir / "requests.seen.policy").read_text(encoding="utf-8")
+        )
+        assert policy["version"] == 1
+        assert policy["ignore_query_params"] == ["utm_source"]
+        for path in jobdir.rglob("*"):
+            if path.is_file():
+                contents = path.read_bytes()
+                assert b"alice" not in contents
+                assert b"bob" not in contents
+
+        # resuming with the same policy reuses the stored fingerprints
+        crawler = get_crawler(FingerprintScopeSpider, settings)
+        await crawler.crawl_async(**crawl_kwargs)
+        assert crawler.stats.get_value("dupefilter/filtered") == 4
+        assert isinstance(crawler.spider, FingerprintScopeSpider)
+        assert not crawler.spider.received_uris
+
+        # resuming with a different policy is refused
+        mismatch_settings = {
+            **settings,
+            "REQUEST_FINGERPRINT_IGNORE_QUERY_PARAMS": ["utm_medium"],
+        }
+        crawler = get_crawler(FingerprintScopeSpider, mismatch_settings)
+        with pytest.raises(ValueError, match="ignore_query_params"):
+            await crawler.crawl_async(**crawl_kwargs)
 
     @coroutine_test
     async def test_fixed_delay(self, mockserver: MockServer) -> None:

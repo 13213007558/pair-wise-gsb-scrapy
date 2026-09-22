@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 from hashlib import sha1
-from typing import TYPE_CHECKING, Any, Protocol
+from typing import TYPE_CHECKING, Any, Protocol, cast
 from weakref import WeakKeyDictionary
 
 import pytest
@@ -10,6 +10,7 @@ import pytest
 from scrapy.http import Request
 from scrapy.utils.python import to_bytes
 from scrapy.utils.request import (
+    RequestFingerprinter,
     _fingerprint_cache,
     fingerprint,
     request_httprepr,
@@ -66,20 +67,16 @@ class _FingerprintFunction(Protocol):
         *,
         include_headers: Iterable[bytes | str] | None = None,
         keep_fragments: bool = False,
+        keep_query_params: Iterable[str] | None = None,
+        ignore_query_params: Iterable[str] | None = None,
+        scope: str | None = None,
     ) -> bytes: ...
 
 
 class TestFingerprint:
     function: _FingerprintFunction = staticmethod(fingerprint)
-    cache: (
-        WeakKeyDictionary[
-            Request, dict[tuple[tuple[bytes, ...] | None, bool, bool], bytes]
-        ]
-        | WeakKeyDictionary[
-            Request, dict[tuple[tuple[bytes, ...] | None, bool, bool], str]
-        ]
-    ) = _fingerprint_cache
-    default_cache_key = (None, False, False)
+    cache: WeakKeyDictionary[Request, dict[tuple[Any, ...], bytes]] = _fingerprint_cache
+    default_cache_key = (None, False, False, None, None, None)
     known_hashes: tuple[tuple[Request, bytes | str, dict[str, Any]], ...] = (
         (
             Request("http://example.org"),
@@ -243,6 +240,70 @@ class TestFingerprint:
         assert self.function(r1) != self.function(r2)
         assert self.function(r2) != self.function(r3)
 
+    def test_ignore_query_params(self):
+        r1 = Request("http://www.example.com/p?id=1&utm_source=a")
+        r2 = Request("http://www.example.com/p?id=1&utm_source=b")
+        r3 = Request("http://www.example.com/p?id=1")
+        assert self.function(r1) != self.function(r2)
+        assert self.function(r1, ignore_query_params=["utm_source"]) == self.function(
+            r2, ignore_query_params=["utm_source"]
+        )
+        assert self.function(r1, ignore_query_params=["utm_source"]) == self.function(
+            r3, ignore_query_params=["utm_source"]
+        )
+        # filtering only affects the fingerprint, not the request
+        assert r1.url == "http://www.example.com/p?id=1&utm_source=a"
+
+        # URLs without a query string are left alone
+        r4 = Request("http://www.example.com/no-query")
+        assert self.function(r4, ignore_query_params=["utm_source"]) == self.function(
+            r4
+        )
+
+    def test_ignore_query_params_decoded_names(self):
+        # parameter names are matched after percent-decoding
+        r1 = Request("http://www.example.com/p?utm_%73ource=a&id=1")
+        r2 = Request("http://www.example.com/p?id=1")
+        assert self.function(r1, ignore_query_params=["utm_source"]) == self.function(
+            r2
+        )
+
+    def test_ignore_query_params_keeps_repeated_and_empty(self):
+        r1 = Request("http://www.example.com/p?tag=a&tag=b&empty=&utm_source=x")
+        r2 = Request("http://www.example.com/p?empty=&tag=a&tag=b")
+        assert self.function(r1, ignore_query_params=["utm_source"]) == self.function(
+            r2
+        )
+        # repeated parameters are preserved, not collapsed
+        r3 = Request("http://www.example.com/p?tag=a&empty=")
+        assert self.function(r1, ignore_query_params=["utm_source"]) != self.function(
+            r3
+        )
+
+    def test_keep_query_params(self):
+        r1 = Request("http://www.example.com/p?id=1&utm_source=a")
+        r2 = Request("http://www.example.com/p?id=1")
+        assert self.function(r1, keep_query_params=["id"]) == self.function(r2)
+        r3 = Request("http://www.example.com/p?id=2")
+        assert self.function(r1, keep_query_params=["id"]) != self.function(
+            r3, keep_query_params=["id"]
+        )
+
+    def test_keep_and_ignore_query_params(self):
+        r1 = Request("http://www.example.com/p?id=1&tag=a&utm_source=x")
+        r2 = Request("http://www.example.com/p?id=1&utm_source=y")
+        assert self.function(
+            r1, keep_query_params=["id", "tag"], ignore_query_params=["tag"]
+        ) == self.function(
+            r2, keep_query_params=["id", "tag"], ignore_query_params=["tag"]
+        )
+
+    def test_scope(self):
+        r1 = Request("http://www.example.com/p?id=1")
+        assert self.function(r1, scope="alice") != self.function(r1, scope="bob")
+        assert self.function(r1, scope="alice") != self.function(r1)
+        assert self.function(r1, scope=None) == self.function(r1)
+
     def test_request_replace(self):
         # cached fingerprint must be cleared on request copy
         r1 = Request("http://www.example.com")
@@ -277,6 +338,82 @@ class TestRequestFingerprinter:
         assert crawler.request_fingerprinter.fingerprint(request) == fingerprint(
             request
         )
+
+    def test_no_crawler(self):
+        fingerprinter = RequestFingerprinter()
+        request = Request("https://example.com/?id=1")
+        assert fingerprinter.fingerprint(request) == fingerprint(request)
+        assert fingerprinter._identity_policy() == {
+            "version": 1,
+            "scope": None,
+            "keep_query_params": [],
+            "ignore_query_params": [],
+            "include_headers": [],
+        }
+
+    def test_settings(self):
+        settings = {
+            "REQUEST_FINGERPRINT_INCLUDE_HEADERS": ["X-ID"],
+            "REQUEST_FINGERPRINT_IGNORE_QUERY_PARAMS": ["utm_source"],
+            "REQUEST_FINGERPRINT_SCOPE": "alice",
+        }
+        crawler = get_crawler(settings_dict=settings)
+        fingerprinter = crawler.request_fingerprinter
+
+        r1 = Request("https://example.com/?id=1&utm_source=a")
+        r2 = Request("https://example.com/?id=1&utm_source=b")
+        assert fingerprinter.fingerprint(r1) == fingerprinter.fingerprint(r2)
+
+        r3 = Request("https://example.com/?id=1&utm_source=a", headers={"X-ID": "1"})
+        r4 = Request("https://example.com/?id=1&utm_source=a", headers={"X-ID": "2"})
+        assert fingerprinter.fingerprint(r3) != fingerprinter.fingerprint(r4)
+
+        assert fingerprinter.fingerprint(r1) == fingerprint(
+            r1,
+            include_headers=["X-ID"],
+            ignore_query_params=["utm_source"],
+            scope="alice",
+        )
+
+    def test_keep_query_params_setting(self):
+        settings = {"REQUEST_FINGERPRINT_KEEP_QUERY_PARAMS": ["id"]}
+        crawler = get_crawler(settings_dict=settings)
+        fingerprinter = crawler.request_fingerprinter
+        r1 = Request("https://example.com/?id=1&utm_source=a")
+        r2 = Request("https://example.com/?id=1")
+        assert fingerprinter.fingerprint(r1) == fingerprinter.fingerprint(r2)
+
+    def test_fingerprint_scope_meta(self):
+        settings = {"REQUEST_FINGERPRINT_SCOPE": "alice"}
+        crawler = get_crawler(settings_dict=settings)
+        fingerprinter = crawler.request_fingerprinter
+        r1 = Request("https://example.com/")
+        r2 = Request("https://example.com/", meta={"fingerprint_scope": "bob"})
+        r3 = Request("https://example.com/", meta={"fingerprint_scope": "alice"})
+        assert fingerprinter.fingerprint(r1) != fingerprinter.fingerprint(r2)
+        assert fingerprinter.fingerprint(r1) == fingerprinter.fingerprint(r3)
+
+    def test_identity_policy(self):
+        settings = {
+            "REQUEST_FINGERPRINT_INCLUDE_HEADERS": ["X-ID"],
+            "REQUEST_FINGERPRINT_IGNORE_QUERY_PARAMS": ["utm_source"],
+            "REQUEST_FINGERPRINT_SCOPE": "alice-secret",
+        }
+        crawler = get_crawler(settings_dict=settings)
+        fingerprinter = cast("RequestFingerprinter", crawler.request_fingerprinter)
+        policy = fingerprinter._identity_policy()
+        assert policy["version"] == 1
+        assert policy["include_headers"] == ["x-id"]
+        assert policy["ignore_query_params"] == ["utm_source"]
+        assert policy["keep_query_params"] == []
+        # the policy summary must not contain the scope in clear text
+        assert "alice-secret" not in json.dumps(policy)
+
+        crawler2 = get_crawler()
+        fingerprinter2 = cast("RequestFingerprinter", crawler2.request_fingerprinter)
+        policy2 = fingerprinter2._identity_policy()
+        assert policy2["scope"] is None
+        assert policy != policy2
 
 
 class TestCustomRequestFingerprinter:

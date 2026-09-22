@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import logging
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -87,6 +88,12 @@ class RFPDupeFilter(BaseDupeFilter):
     file named :file:`requests.seen` in the :ref:`job directory <job-dir>`,
     where each fingerprint is stored as its big-endian, 2-byte length followed
     by the fingerprint itself.
+
+     A JSON file named :file:`requests.seen.policy` records the version and
+     configuration summary of the request identity policy that generated
+     those fingerprints. When a crawl is resumed with a policy that does not
+     match the recorded one, a :exc:`ValueError` is raised instead of mixing
+     incompatible fingerprints, and the differing policy keys are reported.
     """
 
     def __init__(
@@ -115,6 +122,7 @@ class RFPDupeFilter(BaseDupeFilter):
                 stacklevel=2,
             )
         if path:
+            self._check_identity_policy(Path(path))
             self.file = Path(path, "requests.seen").open("a+b")
             self.file.seek(0)
             self._fingerprints.update(_read_fingerprints(self.file.read()))
@@ -145,6 +153,33 @@ class RFPDupeFilter(BaseDupeFilter):
         if self.file:
             self.file.write(len(fp).to_bytes(_SIZE_BYTES, "big") + fp)
         return False
+
+    def _check_identity_policy(self, path: Path) -> None:
+        get_policy = getattr(self.fingerprinter, "_identity_policy", None)
+        if get_policy is None:
+            return
+        policy = get_policy()
+        policy_file = path / "requests.seen.policy"
+        if not policy_file.exists():
+            policy_file.write_text(
+                json.dumps(policy, indent=2, sort_keys=True) + "\n",
+                encoding="utf-8",
+            )
+            return
+        stored = json.loads(policy_file.read_text(encoding="utf-8"))
+        if stored == policy:
+            return
+        differences = sorted(
+            key for key in {*stored, *policy} if stored.get(key) != policy.get(key)
+        )
+        raise ValueError(
+            f"The request identity policy of this crawl does not match the"
+            f" one recorded in {policy_file} by a previous crawl (differing"
+            f" keys: {', '.join(differences)}). Fingerprints seen by the"
+            f" previous crawl cannot be reused with a different policy."
+            f" Restore the previous request fingerprint configuration or"
+            f" use a different JOBDIR."
+        )
 
     def _fingerprint(self, request: Request) -> bytes:
         if self._legacy_fingerprint:

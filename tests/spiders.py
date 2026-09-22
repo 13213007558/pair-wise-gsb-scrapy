@@ -469,6 +469,32 @@ class DuplicateStartSpider(MockServerSpider):
         self.visited += 1
 
 
+class FingerprintScopeSpider(MockServerSpider):
+    """Request the same URLs once per account, tagging each request with
+    its account as :reqmeta:`fingerprint_scope`, and record the URIs that
+    the server actually received."""
+
+    name = "fingerprint_scope"
+
+    def __init__(self, urls, accounts, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.urls = urls
+        self.accounts = accounts
+        self.received_uris: dict[str, list[str]] = {}
+
+    async def start(self) -> AsyncIterator[Any]:
+        for account in self.accounts:
+            for url in self.urls:
+                yield Request(
+                    url,
+                    meta={"fingerprint_scope": account},
+                    cb_kwargs={"account": account},
+                )
+
+    def parse(self, response, account):
+        self.received_uris.setdefault(account, []).append(response.text)
+
+
 class CrawlSpiderWithParseMethod(MockServerSpider, CrawlSpider):
     """
     A CrawlSpider which overrides the 'parse' method

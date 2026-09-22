@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import logging
 import shutil
 import tempfile
@@ -138,6 +139,113 @@ class TestRFPDupeFilter:
         assert case_insensitive_dupefilter.request_seen(r2)
 
         case_insensitive_dupefilter.close("finished")
+
+    def test_identity_policy_file(self):
+        settings = {
+            "REQUEST_FINGERPRINT_IGNORE_QUERY_PARAMS": ["utm_source"],
+            "REQUEST_FINGERPRINT_SCOPE": "alice-secret",
+        }
+        r1 = Request("http://scrapytest.org/1?utm_source=a")
+
+        path = tempfile.mkdtemp()
+        try:
+            df = _get_dupefilter(settings={**settings, "JOBDIR": path}, open_=False)
+            try:
+                df.open()
+                assert not df.request_seen(r1)
+            finally:
+                df.close("finished")
+
+            policy_file = Path(path, "requests.seen.policy")
+            policy = json.loads(policy_file.read_text(encoding="utf-8"))
+            assert policy["version"] == 1
+            assert policy["ignore_query_params"] == ["utm_source"]
+            # the policy file must not contain the scope in clear text
+            assert "alice-secret" not in policy_file.read_text(encoding="utf-8")
+
+            # resuming with the same policy reuses the stored fingerprints
+            df2 = _get_dupefilter(settings={**settings, "JOBDIR": path}, open_=False)
+            try:
+                df2.open()
+                assert df2.request_seen(r1)
+            finally:
+                df2.close("finished")
+        finally:
+            shutil.rmtree(path)
+
+    @pytest.mark.parametrize(
+        ("settings", "difference"),
+        [
+            ({"REQUEST_FINGERPRINT_SCOPE": "bob"}, "scope"),
+            (
+                {"REQUEST_FINGERPRINT_IGNORE_QUERY_PARAMS": ["utm_source"]},
+                "ignore_query_params",
+            ),
+            ({"REQUEST_FINGERPRINT_KEEP_QUERY_PARAMS": ["id"]}, "keep_query_params"),
+            ({"REQUEST_FINGERPRINT_INCLUDE_HEADERS": ["X-ID"]}, "include_headers"),
+        ],
+    )
+    def test_identity_policy_mismatch(self, settings, difference):
+        r1 = Request("http://scrapytest.org/1")
+
+        path = tempfile.mkdtemp()
+        try:
+            df = _get_dupefilter(settings={"JOBDIR": path}, open_=False)
+            try:
+                df.open()
+                assert not df.request_seen(r1)
+            finally:
+                df.close("finished")
+
+            seen_file = Path(path, "requests.seen")
+            seen_before = seen_file.read_bytes()
+
+            with pytest.raises(ValueError, match=difference):
+                _get_dupefilter(settings={**settings, "JOBDIR": path}, open_=False)
+
+            # the stored fingerprints are left untouched
+            assert seen_file.read_bytes() == seen_before
+        finally:
+            shutil.rmtree(path)
+
+    def test_identity_policy_custom_fingerprinter(self):
+        # fingerprinters without an identity policy skip the policy check
+        class RequestFingerprinter:
+            def fingerprint(self, request):
+                return hashlib.sha1(to_bytes(request.url)).digest()
+
+        path = tempfile.mkdtemp()
+        try:
+            settings = {
+                "JOBDIR": path,
+                "REQUEST_FINGERPRINTER_CLASS": RequestFingerprinter,
+            }
+            df = _get_dupefilter(settings=settings, open_=False)
+            try:
+                df.open()
+                assert not df.request_seen(Request("http://scrapytest.org/1"))
+            finally:
+                df.close("finished")
+            assert not Path(path, "requests.seen.policy").exists()
+        finally:
+            shutil.rmtree(path)
+
+    def test_request_seen_with_identity_policy(self):
+        settings = {
+            "REQUEST_FINGERPRINT_IGNORE_QUERY_PARAMS": ["utm_source"],
+        }
+        dupefilter = _get_dupefilter(settings=settings)
+        r1 = Request("http://scrapytest.org/1?utm_source=a")
+        r2 = Request("http://scrapytest.org/1?utm_source=b")
+        r3 = Request(
+            "http://scrapytest.org/1?utm_source=a",
+            meta={"fingerprint_scope": "bob"},
+        )
+        assert not dupefilter.request_seen(r1)
+        assert dupefilter.request_seen(r2)
+        # a different scope is a different request
+        assert not dupefilter.request_seen(r3)
+        dupefilter.close("finished")
 
     def test_seenreq_truncated(self):
         r1 = Request("http://scrapytest.org/1")

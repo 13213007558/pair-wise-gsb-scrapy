@@ -367,6 +367,17 @@ HttpCacheMiddleware
     You can change the HTTP cache policy with the :setting:`HTTPCACHE_POLICY`
     setting. Or you can also implement your own policy.
 
+    .. versionchanged:: VERSION
+        Responses with a ``Vary`` header are cached as separate variants.
+
+    When a response carries a ``Vary`` header, it is cached as one of
+    possibly several variants of the same request: the cache keeps a
+    separate response for each combination of values of the request headers
+    named in the ``Vary`` header, and serves each request the variant
+    matching its own headers. Responses with a ``Vary: *`` header are never
+    cached. Cache entries written before this change are only reused if
+    their response does not vary.
+
     .. reqmeta:: dont_cache
 
     You can also avoid caching a response on every policy using :reqmeta:`dont_cache` meta key equals ``True``.
@@ -425,6 +436,7 @@ RFC2616 policy
     * Revalidate stale responses based on ``ETag`` response header
     * Set ``Date`` header for any received response missing it
     * Support ``max-stale`` cache-control directive in requests
+    * Cache response variants based on the ``Vary`` response header
 
     This allows spiders to be configured with the full RFC2616 cache policy,
     but avoid revalidation on a request-by-request basis, while remaining
@@ -440,7 +452,6 @@ RFC2616 policy
     What is missing:
 
     * ``Pragma: no-cache`` support https://www.w3.org/Protocols/rfc2616/rfc2616-sec14.html#sec14.9.1
-    * ``Vary`` header support https://www.w3.org/Protocols/rfc2616/rfc2616-sec13.html#sec13.6
     * Invalidation after updates or deletes https://www.w3.org/Protocols/rfc2616/rfc2616-sec13.html#sec13.10
     * ... probably others ..
 
@@ -454,8 +465,17 @@ Filesystem storage backend (default)
 
     File system storage backend is available for the HTTP cache middleware.
 
-    Each request/response pair is stored in a different directory containing
-    the following files:
+    Each request gets a different directory, named after the request
+    fingerprint (see ``scrapy.utils.request.fingerprint``), and one level of
+    subdirectories is used to avoid creating too many files into the same
+    directory (which is inefficient in many file systems). An example
+    directory could be::
+
+        /path/to/cache/dir/example.com/72/72811f648e718090f041317756c03adb0ada46c7
+
+    The directory contains a ``vary_index`` file with the pickled list of
+    cached response variants, and one subdirectory of :file:`variants` per
+    variant, containing the following files:
 
     *   ``request_body`` - the plain request body
 
@@ -473,13 +493,6 @@ Filesystem storage backend (default)
 
     *   ``pickled_meta`` - the same metadata in ``meta`` but pickled for more
         efficient deserialization
-
-    The directory name is made from the request fingerprint (see
-    ``scrapy.utils.request.fingerprint``), and one level of subdirectories is
-    used to avoid creating too many files into the same directory (which is
-    inefficient in many file systems). An example directory could be::
-
-        /path/to/cache/dir/example.com/72/72811f648e718090f041317756c03adb0ada46c7
 
 .. _httpcache-storage-dbm:
 

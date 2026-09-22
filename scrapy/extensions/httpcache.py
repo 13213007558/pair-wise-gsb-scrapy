@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import gzip
+import hashlib
 import logging
 import pickle
+import shutil
 from datetime import timezone
 from email.utils import parsedate_to_datetime
 from importlib import import_module
@@ -31,6 +33,54 @@ if TYPE_CHECKING:
 
 
 logger = logging.getLogger(__name__)
+
+
+# A variant index entry: (sorted Vary field names, values of those fields in
+# the stored request, variant id). It maps requests to one of the response
+# variants stored under a single request fingerprint.
+_VariantEntry = tuple[tuple[bytes, ...], tuple[tuple[bytes, ...] | None, ...], str]
+
+
+def _vary_fields(response: Response) -> frozenset[bytes] | None:
+    """Return the lower-cased field names of the Vary header of *response*.
+
+    Return ``None`` if the Vary header is ``*``, meaning that the response
+    must never be served from the cache.
+    """
+    fields: set[bytes] = set()
+    for header in response.headers.getlist(b"Vary"):
+        for value in header.split(b","):
+            name = value.strip().lower()
+            if name == b"*":
+                return None
+            if name:
+                fields.add(name)
+    return frozenset(fields)
+
+
+def _vary_values(
+    request: Request, fields: tuple[bytes, ...]
+) -> tuple[tuple[bytes, ...] | None, ...]:
+    """Return the values of the header *fields* of *request*.
+
+    A missing header is represented by ``None``, telling it apart from a
+    header that is present but empty.
+    """
+    return tuple(tuple(request.headers.getlist(field)) or None for field in fields)
+
+
+def _variant_id(
+    fields: tuple[bytes, ...], values: tuple[tuple[bytes, ...] | None, ...]
+) -> str:
+    return hashlib.sha256(repr((fields, values)).encode()).hexdigest()
+
+
+def _find_variant(index: list[_VariantEntry], request: Request) -> str | None:
+    """Return the id of the indexed variant that matches *request*, if any."""
+    for fields, values, variant_id in index:
+        if _vary_values(request, fields) == values:
+            return variant_id
+    return None
 
 
 class DummyPolicy:
@@ -281,23 +331,82 @@ class DbmCacheStorage:
         self, spider: Spider, request: Request, response: Response
     ) -> None:
         key = self._fingerprinter.fingerprint(request).hex()
-        self.db[f"{key}_data"] = pickle.dumps(response.to_dict(), protocol=4)
-        self.db[f"{key}_time"] = str(time())
+        try:
+            index = self._read_index(key)
+        except Exception:
+            index = None  # unreadable index, start over
+        kept: list[_VariantEntry] = []
+        for fields, values, variant_id in index or []:
+            if _vary_values(request, fields) == values:
+                # The new response supersedes this variant, e.g. when a
+                # revalidation changed the Vary field set.
+                self._delete_variant(key, variant_id)
+            else:
+                kept.append((fields, values, variant_id))
+        # Remove entries written before variant support existed.
+        for suffix in ("data", "time"):
+            legacy_key = f"{key}_{suffix}"
+            if legacy_key in self.db:
+                del self.db[legacy_key]
+        vary = _vary_fields(response)
+        if vary is None:
+            # A Vary: * response must never be served from the cache.
+            self._write_index(key, kept)
+            return
+        fields = tuple(sorted(vary))
+        values = _vary_values(request, fields)
+        variant_id = _variant_id(fields, values)
+        self.db[f"{key}_data_{variant_id}"] = pickle.dumps(
+            response.to_dict(), protocol=4
+        )
+        self.db[f"{key}_time_{variant_id}"] = str(time())
+        kept.append((fields, values, variant_id))
+        self._write_index(key, kept)
+
+    def _read_index(self, key: str) -> list[_VariantEntry] | None:
+        ikey = f"{key}_index"
+        if ikey not in self.db:
+            return None
+        return cast("list[_VariantEntry]", pickle.loads(self.db[ikey]))  # noqa: S301
+
+    def _write_index(self, key: str, index: list[_VariantEntry]) -> None:
+        self.db[f"{key}_index"] = pickle.dumps(index, protocol=4)
+
+    def _delete_variant(self, key: str, variant_id: str) -> None:
+        for suffix in ("data", "time"):
+            vkey = f"{key}_{suffix}_{variant_id}"
+            if vkey in self.db:
+                del self.db[vkey]
 
     def _read_data(
         self, spider: Spider, request: Request
     ) -> tuple[dict[str, Any], float] | None:
         key = self._fingerprinter.fingerprint(request).hex()
         db = self.db
-        tkey = f"{key}_time"
+        index = self._read_index(key)
+        if index is None:
+            # Entry written before variant support existed. It can only be
+            # reused if its response does not vary.
+            tkey = f"{key}_time"
+            if tkey not in db:
+                return None  # not found
+            ts = float(db[tkey])
+            if 0 < self.expiration_secs < time() - ts:
+                return None  # expired
+            data = cast("dict[str, Any]", pickle.loads(db[f"{key}_data"]))  # noqa: S301
+            if any(header.lower() == b"vary" for header in data.get("headers", {})):
+                return None  # cannot tell which variant it is
+            return data, ts
+        variant_id = _find_variant(index, request)
+        if variant_id is None:
+            return None  # no variant matches this request
+        tkey = f"{key}_time_{variant_id}"
         if tkey not in db:
             return None  # not found
-
         ts = float(db[tkey])
         if 0 < self.expiration_secs < time() - ts:
             return None  # expired
-
-        data = cast("dict[str, Any]", pickle.loads(db[f"{key}_data"]))  # noqa: S301
+        data = cast("dict[str, Any]", pickle.loads(db[f"{key}_data_{variant_id}"]))  # noqa: S301
         return data, ts
 
 
@@ -327,10 +436,27 @@ class FilesystemCacheStorage:
 
     def retrieve_response(self, spider: Spider, request: Request) -> Response | None:
         """Return response if present in cache, or None otherwise."""
-        metadata = self._read_meta(spider, request)
+        rpath = Path(self._get_request_path(spider, request))
+        index = self._read_index(rpath)
+        legacy = index is None
+        if index is not None:
+            variant_id = _find_variant(index, request)
+            if variant_id is None:
+                return None  # no variant matches this request
+            rpath = rpath / "variants" / variant_id
+        metadata = self._read_meta(rpath)
         if metadata is None:
             return None  # not cached
-        rpath = Path(self._get_request_path(spider, request))
+        response = self._read_response(rpath, metadata)
+        if legacy and b"Vary" in response.headers:
+            # Entries written before variant support existed cannot be
+            # mapped to a variant, so they can only be reused if their
+            # response does not vary.
+            return None
+        request.meta["cache_timestamp"] = metadata["timestamp"]
+        return response
+
+    def _read_response(self, rpath: Path, metadata: dict[str, Any]) -> Response:
         with self._open(rpath / "response_body", "rb") as f:
             body = f.read()
         with self._open(rpath / "response_headers", "rb") as f:
@@ -345,7 +471,6 @@ class FilesystemCacheStorage:
         if datapath.exists():
             with self._open(datapath, "rb") as f:
                 data.update(pickle.load(f))  # noqa: S301
-        request.meta["cache_timestamp"] = metadata["timestamp"]
         return response_from_dict(data)
 
     def store_response(
@@ -353,8 +478,39 @@ class FilesystemCacheStorage:
     ) -> None:
         """Store the given response in the cache."""
         rpath = Path(self._get_request_path(spider, request))
-        if not rpath.exists():
-            rpath.mkdir(parents=True)
+        try:
+            index = self._read_index(rpath)
+        except Exception:
+            index = None  # unreadable index, start over
+        kept: list[_VariantEntry] = []
+        for fields, values, variant_id in index or []:
+            if _vary_values(request, fields) == values:
+                # The new response supersedes this variant, e.g. when a
+                # revalidation changed the Vary field set.
+                shutil.rmtree(rpath / "variants" / variant_id, ignore_errors=True)
+            else:
+                kept.append((fields, values, variant_id))
+        # Remove entries written before variant support existed.
+        for name in (
+            "meta",
+            "pickled_meta",
+            "response_headers",
+            "response_body",
+            "response_data",
+            "request_headers",
+            "request_body",
+        ):
+            (rpath / name).unlink(missing_ok=True)
+        vary = _vary_fields(response)
+        if vary is None:
+            # A Vary: * response must never be served from the cache.
+            self._write_index(rpath, kept)
+            return
+        fields = tuple(sorted(vary))
+        values = _vary_values(request, fields)
+        variant_id = _variant_id(fields, values)
+        vpath = rpath / "variants" / variant_id
+        vpath.mkdir(parents=True, exist_ok=True)
         metadata = {
             "url": request.url,
             "method": request.method,
@@ -362,32 +518,45 @@ class FilesystemCacheStorage:
             "response_url": response.url,
             "timestamp": time(),
         }
-        with self._open(rpath / "meta", "wb") as f:
+        with self._open(vpath / "meta", "wb") as f:
             f.write(to_bytes(repr(metadata)))
-        with self._open(rpath / "pickled_meta", "wb") as f:
+        with self._open(vpath / "pickled_meta", "wb") as f:
             pickle.dump(metadata, f, protocol=4)
-        with self._open(rpath / "response_headers", "wb") as f:
+        with self._open(vpath / "response_headers", "wb") as f:
             f.write(headers_dict_to_raw(response.headers))
-        with self._open(rpath / "response_body", "wb") as f:
+        with self._open(vpath / "response_body", "wb") as f:
             f.write(response.body)
         data = {
             key: value
             for key, value in response.to_dict().items()
             if key not in {"url", "status", "headers", "body"}
         }
-        with self._open(rpath / "response_data", "wb") as f:
+        with self._open(vpath / "response_data", "wb") as f:
             pickle.dump(data, f, protocol=4)
-        with self._open(rpath / "request_headers", "wb") as f:
+        with self._open(vpath / "request_headers", "wb") as f:
             f.write(headers_dict_to_raw(request.headers))
-        with self._open(rpath / "request_body", "wb") as f:
+        with self._open(vpath / "request_body", "wb") as f:
             f.write(request.body)
+        kept.append((fields, values, variant_id))
+        self._write_index(rpath, kept)
+
+    def _read_index(self, rpath: Path) -> list[_VariantEntry] | None:
+        ipath = rpath / "vary_index"
+        if not ipath.exists():
+            return None
+        with self._open(ipath, "rb") as f:
+            return cast("list[_VariantEntry]", pickle.load(f))  # noqa: S301
+
+    def _write_index(self, rpath: Path, index: list[_VariantEntry]) -> None:
+        rpath.mkdir(parents=True, exist_ok=True)
+        with self._open(rpath / "vary_index", "wb") as f:
+            pickle.dump(index, f, protocol=4)
 
     def _get_request_path(self, spider: Spider, request: Request) -> str:
         key = self._fingerprinter.fingerprint(request).hex()
         return str(Path(self.cachedir, spider.name, key[0:2], key))
 
-    def _read_meta(self, spider: Spider, request: Request) -> dict[str, Any] | None:
-        rpath = Path(self._get_request_path(spider, request))
+    def _read_meta(self, rpath: Path) -> dict[str, Any] | None:
         metapath = rpath / "pickled_meta"
         if not metapath.exists():
             return None  # not found

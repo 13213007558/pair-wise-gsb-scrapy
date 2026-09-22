@@ -283,6 +283,38 @@ class Echo(LeafResource):
     render_POST = render_GET
 
 
+class Vary(LeafResource):
+    """Return a different body per Accept-Language, with Vary and ETag.
+
+    Revalidations get a 304 response if If-None-Match matches the ETag of
+    the requested language variant. The received If-None-Match value is
+    echoed back in the X-Echo-If-None-Match response header so that tests
+    can check which conditional headers were sent.
+    """
+
+    bodies: ClassVar[dict[bytes, bytes]] = {
+        b"en": b"Hello",
+        b"zh": "\u4f60\u597d".encode(),
+    }
+
+    def render_GET(self, request: Request) -> bytes:
+        lang = request.getHeader(b"Accept-Language")
+        if lang not in self.bodies:
+            lang = b"en"
+        etag = b'"' + lang + b'"'
+        request.setHeader(b"Content-Type", b"text/plain; charset=utf-8")
+        request.setHeader(b"Cache-Control", b"max-age=3600")
+        request.setHeader(b"ETag", etag)
+        request.setHeader(b"Vary", b"Accept-Language")
+        if_none_match = request.getHeader(b"If-None-Match")
+        if if_none_match is not None:
+            request.setHeader(b"X-Echo-If-None-Match", if_none_match)
+            if if_none_match == etag:
+                request.setResponseCode(304)
+                return b""
+        return self.bodies[lang]
+
+
 class RedirectTo(LeafResource):
     def render(self, request: Request) -> bytes:
         goto = getarg(request, b"goto", b"/")

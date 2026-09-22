@@ -1,10 +1,15 @@
 from __future__ import annotations
 
 import csv
+import gzip
+import hashlib
 import json
 import logging
 import marshal
+import os
 import pickle
+import subprocess
+import sys
 import tempfile
 from logging import getLogger
 from pathlib import Path
@@ -25,8 +30,10 @@ from scrapy.extensions.feedexport import (
     FeedSlot,
     FileFeedStorage,
     ItemFilter,
+    _FeedManifest,
     apply_uri_params,
 )
+from scrapy.extensions.postprocessing import GzipPlugin
 from scrapy.utils.misc import build_from_crawler
 from scrapy.utils.python import to_unicode
 from scrapy.utils.test import get_crawler
@@ -95,6 +102,15 @@ class LogOnStoreFileStorage:
     def store(self, file):
         self.logger.info("Storage.store is called")
         file.close()
+
+
+class FailingBatchFileStorage(FileFeedStorage):
+    """File storage that fails to store the batch 2 file."""
+
+    def store(self, file):
+        file.close()
+        if self.path.endswith("batch-2.jl"):
+            raise OSError("Cannot store")
 
 
 class InstrumentedFeedSlot(FeedSlot):
@@ -1392,6 +1408,327 @@ class TestFeedExportInit:
         crawler = get_crawler(settings_dict=settings)
         exporter = build_from_crawler(FeedExporter, crawler)
         assert isinstance(exporter, FeedExporter)
+
+
+_CRASH_RESUME_SCRIPT = """
+import asyncio
+import os
+import sys
+
+import scrapy
+from scrapy.extensions.feedexport import FileFeedStorage
+from scrapy.utils.test import get_crawler
+
+out_dir = sys.argv[1]
+crash = sys.argv[2] == "1"
+
+
+class CrashStorage(FileFeedStorage):
+    def store(self, file):
+        super().store(file)
+        if crash and self.path.endswith("batch-2.jl.gz"):
+            os._exit(1)
+
+
+class TestSpider(scrapy.Spider):
+    name = "testspider"
+
+    async def start(self):
+        for i in range(5):
+            yield {"i": i}
+
+
+async def main():
+    crawler = get_crawler(
+        TestSpider,
+        {
+            "FEEDS": {
+                os.path.join(out_dir, "batch-%(batch_id)d.jl.gz"): {
+                    "format": "jl",
+                    "batch_item_count": 2,
+                    "manifest": True,
+                    "postprocessing": ["scrapy.extensions.postprocessing.GzipPlugin"],
+                }
+            },
+            "FEED_STORAGES": {"": CrashStorage, "file": CrashStorage},
+            "TWISTED_REACTOR": "twisted.internet.asyncioreactor.AsyncioSelectorReactor",
+        },
+    )
+    await crawler.crawl_async()
+
+
+asyncio.run(main())
+"""
+
+
+class TestFeedExportManifest:
+    """Tests for the ``manifest`` feed option."""
+
+    @staticmethod
+    def _spider_cls(item_count: int = 5) -> type[Spider]:
+        class TestSpider(scrapy.Spider):
+            name = "testspider"
+
+            async def start(self):
+                for i in range(item_count):
+                    yield {"i": i}
+
+        return TestSpider
+
+    async def _crawl(self, settings: dict[str, Any], item_count: int = 5) -> None:
+        crawler = get_crawler(self._spider_cls(item_count), settings)
+        await crawler.crawl_async()
+
+    @staticmethod
+    def _settings(
+        feed_dir: Path, template: str = "batch-%(batch_id)d.jl", **feed_options: Any
+    ) -> dict[str, Any]:
+        options: dict[str, Any] = {
+            "format": "jl",
+            "batch_item_count": 2,
+            "manifest": True,
+        }
+        options.update(feed_options)
+        return {"FEEDS": {str(feed_dir / template): options}}
+
+    @staticmethod
+    def _read_manifest(
+        manifest_path: Path,
+    ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+        lines = manifest_path.read_text(encoding="utf-8").splitlines()
+        return json.loads(lines[0]), [json.loads(line) for line in lines[1:]]
+
+    @staticmethod
+    def _assert_committed_files(
+        manifest_path: Path, entries: list[dict[str, Any]]
+    ) -> None:
+        for entry in entries:
+            file_path = manifest_path.parent / entry["file"]
+            assert file_path.is_file()
+            assert file_path.stat().st_size == entry["bytes"]
+            assert hashlib.sha256(file_path.read_bytes()).hexdigest() == entry["sha256"]
+
+    async def test_committed_batches(self, tmp_path: Path) -> None:
+        settings = self._settings(
+            tmp_path,
+            "batch-%(batch_id)d.jl.gz",
+            fields=("i",),
+            postprocessing=[GzipPlugin],
+        )
+        await self._crawl(settings)
+        manifest_path = tmp_path / "batch-.jl.gz.manifest.jsonl"
+        header, entries = self._read_manifest(manifest_path)
+        assert header["uri_template"] == str(tmp_path / "batch-%(batch_id)d.jl.gz")
+        assert header["config"]["postprocessing"] == [str(GzipPlugin)]
+        assert [entry["batch_id"] for entry in entries] == [1, 2, 3]
+        assert [entry["item_count"] for entry in entries] == [2, 2, 1]
+        self._assert_committed_files(manifest_path, entries)
+        items: list[dict[str, Any]] = []
+        for entry in entries:
+            with gzip.open(manifest_path.parent / entry["file"], "rt") as file:
+                items.extend(json.loads(line) for line in file)
+        assert items == [{"i": i} for i in range(5)]
+
+    async def test_multiple_feeds(self, tmp_path: Path) -> None:
+        settings = {
+            "FEEDS": {
+                str(tmp_path / "a" / "batch-%(batch_id)d.jl"): {
+                    "format": "jl",
+                    "batch_item_count": 2,
+                    "manifest": True,
+                },
+                path_to_url(tmp_path / "b") + "/batch-%(batch_id)d.jl": {
+                    "format": "jl",
+                    "batch_item_count": 3,
+                    "manifest": True,
+                },
+            }
+        }
+        await self._crawl(settings)
+        manifest_a = tmp_path / "a" / "batch-.jl.manifest.jsonl"
+        _, entries_a = self._read_manifest(manifest_a)
+        assert [entry["batch_id"] for entry in entries_a] == [1, 2, 3]
+        self._assert_committed_files(manifest_a, entries_a)
+        manifest_b = tmp_path / "b" / "batch-.jl.manifest.jsonl"
+        _, entries_b = self._read_manifest(manifest_b)
+        assert [entry["batch_id"] for entry in entries_b] == [1, 2]
+        self._assert_committed_files(manifest_b, entries_b)
+
+    def test_requires_batch_item_count(self, tmp_path: Path) -> None:
+        settings = self._settings(tmp_path, batch_item_count=0)
+        crawler = get_crawler(settings_dict=settings)
+        with pytest.raises(NotConfigured):
+            build_from_crawler(FeedExporter, crawler)
+
+    def test_requires_batch_id_placeholder(self, tmp_path: Path) -> None:
+        settings = self._settings(tmp_path, "batch-%(batch_time)s.jl")
+        crawler = get_crawler(settings_dict=settings)
+        with pytest.raises(NotConfigured):
+            build_from_crawler(FeedExporter, crawler)
+
+    def test_requires_file_storage(self) -> None:
+        settings = {
+            "FEEDS": {
+                "stdout:%(batch_id)d": {
+                    "format": "jl",
+                    "batch_item_count": 2,
+                    "manifest": True,
+                }
+            }
+        }
+        crawler = get_crawler(settings_dict=settings)
+        with pytest.raises(NotConfigured):
+            build_from_crawler(FeedExporter, crawler)
+
+    async def test_failed_batch_is_not_committed(self, tmp_path: Path) -> None:
+        settings = self._settings(tmp_path)
+        settings["FEED_STORAGES"] = {
+            "": FailingBatchFileStorage,
+            "file": FailingBatchFileStorage,
+        }
+        await self._crawl(settings)
+        manifest_path = tmp_path / "batch-.jl.manifest.jsonl"
+        _, entries = self._read_manifest(manifest_path)
+        assert [entry["batch_id"] for entry in entries] == [1, 3]
+        self._assert_committed_files(manifest_path, entries)
+        # The file of the failed batch exists but is not committed.
+        assert (tmp_path / "batch-2.jl").is_file()
+
+    async def test_resume_continues_with_unused_batch_ids(self, tmp_path: Path) -> None:
+        settings = self._settings(tmp_path)
+        await self._crawl(settings, item_count=4)
+        manifest_path = tmp_path / "batch-.jl.manifest.jsonl"
+        digests = {
+            path.name: hashlib.sha256(path.read_bytes()).hexdigest()
+            for path in tmp_path.glob("batch-*.jl")
+        }
+        await self._crawl(settings, item_count=3)
+        _, entries = self._read_manifest(manifest_path)
+        assert [entry["batch_id"] for entry in entries] == [1, 2, 3, 4]
+        assert [entry["item_count"] for entry in entries] == [2, 2, 2, 1]
+        self._assert_committed_files(manifest_path, entries)
+        # Batches committed by the first run were not overwritten.
+        for name, digest in digests.items():
+            assert hashlib.sha256((tmp_path / name).read_bytes()).hexdigest() == digest
+
+    async def test_resume_removes_uncommitted_files(self, tmp_path: Path) -> None:
+        settings = self._settings(tmp_path)
+        await self._crawl(settings, item_count=4)
+        stale = tmp_path / "batch-3.jl"
+        stale.write_bytes(b'{"stale": 1}\n')
+        await self._crawl(settings, item_count=1)
+        # The stale leftover was removed, not appended to.
+        assert stale.read_bytes() == b'{"i": 0}\n'
+        manifest_path = tmp_path / "batch-.jl.manifest.jsonl"
+        _, entries = self._read_manifest(manifest_path)
+        assert [entry["batch_id"] for entry in entries] == [1, 2, 3]
+        self._assert_committed_files(manifest_path, entries)
+
+    async def test_resume_keeps_manifest_file(self, tmp_path: Path) -> None:
+        settings = self._settings(tmp_path, "batch-%(batch_id)d")
+        await self._crawl(settings, item_count=2)
+        manifest_path = tmp_path / "batch-.manifest.jsonl"
+        assert manifest_path.is_file()
+        await self._crawl(settings, item_count=2)
+        _, entries = self._read_manifest(manifest_path)
+        assert [entry["batch_id"] for entry in entries] == [1, 2]
+
+    async def test_resume_detects_missing_file(self, tmp_path: Path) -> None:
+        settings = self._settings(tmp_path)
+        await self._crawl(settings, item_count=4)
+        (tmp_path / "batch-1.jl").unlink()
+        with pytest.raises(ValueError, match="batch 1"):
+            get_crawler(self._spider_cls(), settings)
+
+    async def test_resume_detects_resized_file(self, tmp_path: Path) -> None:
+        settings = self._settings(tmp_path)
+        await self._crawl(settings, item_count=4)
+        with (tmp_path / "batch-2.jl").open("ab") as file:
+            file.write(b"x")
+        with pytest.raises(ValueError, match="batch 2"):
+            get_crawler(self._spider_cls(), settings)
+
+    async def test_resume_detects_modified_file(self, tmp_path: Path) -> None:
+        settings = self._settings(tmp_path)
+        await self._crawl(settings, item_count=4)
+        path = tmp_path / "batch-2.jl"
+        data = path.read_bytes()
+        path.write_bytes(b"X" + data[1:])
+        with pytest.raises(ValueError, match="batch 2"):
+            get_crawler(self._spider_cls(), settings)
+
+    async def test_resume_detects_feed_option_change(self, tmp_path: Path) -> None:
+        settings = self._settings(tmp_path)
+        await self._crawl(settings, item_count=4)
+        new_settings = self._settings(tmp_path, batch_item_count=3)
+        with pytest.raises(ValueError, match="different feed options"):
+            get_crawler(self._spider_cls(), new_settings)
+
+    async def test_resume_detects_uri_template_change(self, tmp_path: Path) -> None:
+        settings = self._settings(tmp_path)
+        await self._crawl(settings, item_count=2)
+        new_settings = self._settings(tmp_path, "batch-%(batch_id)02d.jl")
+        with pytest.raises(ValueError, match="belongs to"):
+            get_crawler(self._spider_cls(), new_settings)
+
+    @pytest.mark.parametrize("content", ["", "not json\n"])
+    def test_invalid_manifest(self, tmp_path: Path, content: str) -> None:
+        (tmp_path / "batch-.jl.manifest.jsonl").write_text(content, encoding="utf-8")
+        with pytest.raises(ValueError, match="Invalid feed manifest"):
+            get_crawler(self._spider_cls(), self._settings(tmp_path))
+
+    def test_commit_failure_removes_temp_file(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        manifest = _FeedManifest(str(tmp_path / "batch-%(batch_id)d.jl"), {})
+        batch_file = tmp_path / "batch-1.jl"
+        batch_file.write_bytes(b"{}\n")
+
+        def failing_replace(src: str, dst: str) -> None:
+            raise OSError("cannot replace")
+
+        monkeypatch.setattr(os, "replace", failing_replace)
+        with pytest.raises(OSError, match="cannot replace"):
+            manifest.commit(1, str(batch_file), 1)
+        assert not list(tmp_path.glob("*.tmp"))
+
+    def test_crash_before_commit_then_resume(self, tmp_path: Path) -> None:
+        script_path = tmp_path / "crash_resume.py"
+        script_path.write_text(_CRASH_RESUME_SCRIPT, encoding="utf-8")
+        out_dir = tmp_path / "out"
+        command = [sys.executable, str(script_path), str(out_dir)]
+
+        crash = subprocess.run(
+            [*command, "1"], check=False, capture_output=True, text=True
+        )
+        assert crash.returncode == 1, crash.stderr
+        manifest_path = out_dir / "batch-.jl.gz.manifest.jsonl"
+        _, entries = self._read_manifest(manifest_path)
+        assert [entry["batch_id"] for entry in entries] == [1]
+        # The batch 2 file was fully written, but the process was killed
+        # before it could be committed to the manifest.
+        assert (out_dir / "batch-2.jl.gz").is_file()
+        batch_1_sha256 = hashlib.sha256(
+            (out_dir / "batch-1.jl.gz").read_bytes()
+        ).hexdigest()
+
+        resume = subprocess.run(
+            [*command, "0"], check=False, capture_output=True, text=True
+        )
+        assert resume.returncode == 0, resume.stderr
+        _, entries = self._read_manifest(manifest_path)
+        assert [entry["batch_id"] for entry in entries] == [1, 2, 3, 4]
+        assert [entry["item_count"] for entry in entries] == [2, 2, 2, 1]
+        self._assert_committed_files(manifest_path, entries)
+        # The batch committed before the crash was not overwritten.
+        assert (
+            hashlib.sha256((out_dir / "batch-1.jl.gz").read_bytes()).hexdigest()
+            == batch_1_sha256
+        )
+        # The uncommitted leftover was replaced: batch 2 now holds the
+        # re-scraped first two items instead of the stale items 2 and 3.
+        with gzip.open(out_dir / "batch-2.jl.gz", "rt") as file:
+            assert [json.loads(line) for line in file] == [{"i": 0}, {"i": 1}]
 
 
 class TestApplyUriParams:

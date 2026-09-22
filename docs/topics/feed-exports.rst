@@ -526,6 +526,8 @@ as a fallback value if that key is not provided for a specific feed definition:
 -   ``indent``: falls back to :setting:`FEED_EXPORT_INDENT`.
 
 -   ``item_export_kwargs``: :class:`dict` with keyword arguments for the corresponding :ref:`item exporter class <topics-exporters>`.
+-   ``manifest``: whether to keep a :ref:`commit manifest <feed-manifest>`
+    of exported batches (``True``) or not (``False``, the default).
 
 -   ``overwrite``: whether to overwrite the file if it already exists
     (``True``) or append to its content (``False``).
@@ -553,6 +555,59 @@ as a fallback value if that key is not provided for a specific feed definition:
 -   ``postprocessing``: list of :ref:`plugins <post-processing>` to use for post-processing.
 
     The plugins will be used in the order of the list passed.
+
+.. _feed-manifest:
+
+Feed batch commit manifest
+--------------------------
+
+.. versionadded:: VERSION
+
+A feed can keep a commit manifest: a JSON Lines file that lists the batches
+of the feed that were fully exported, post-processed and stored, allowing
+downstream consumers to tell complete batch files apart from incomplete
+ones left behind by an interrupted run.
+
+To enable it, set the ``manifest`` :ref:`feed option <feed-options>` to
+``True``. It requires ``batch_item_count`` to be set and
+``%(batch_id)d`` to be present in the feed URI, and it is only supported
+for :ref:`local file storage <topics-feed-storage-fs>`.
+
+The manifest file is written next to the batch files, named after the feed
+URI without URI placeholders and with ``.manifest.jsonl`` appended. For
+example, the manifest of ``exports/%(batch_id)02d.jl.gz`` is
+:file:`exports/.jl.gz.manifest.jsonl`.
+
+The first line of the manifest records the feed URI template and the feed
+options that affect the output. Every following line describes one
+committed batch: its batch ID (``batch_id``), file name relative to the
+manifest (``file``), item count (``item_count``), size in bytes
+(``bytes``) and SHA-256 hash (``sha256``). For example:
+
+.. code-block:: json
+
+    {"batch_id": 1, "bytes": 2048, "file": "00001.jl.gz", "item_count": 100, "sha256": "b5bb9d8014a0f9b1d61e21e796d78dccdf1352f23cd32812f4850b878ae4944c"}
+
+The manifest is updated atomically, so a partially-written manifest is
+never visible. A batch is added to the manifest only after its file has
+been stored. Batches whose storage fails and batches left incomplete by an
+interrupted run are never listed.
+
+When a crawl starts and the manifest of a feed already exists, the crawl
+resumes the feed instead of starting it over:
+
+-   Committed batch files are validated against the manifest. If a
+    committed file is missing or its size or SHA-256 hash does not match
+    the manifest, or if the recorded feed options no longer match, the
+    crawl stops with an error that identifies the offending batch.
+
+-   Batch numbering continues at the lowest unused batch ID, so previously
+    committed batches are never overwritten.
+
+-   Batch files not listed in the manifest, e.g. left behind by an
+    interrupted run, are removed, and their items are exported again.
+    Removing the resulting duplicates across runs is up to the downstream
+    consumer.
 
 .. setting:: FEED_EXPORT_ENCODING
 

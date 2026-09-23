@@ -1,20 +1,25 @@
 from __future__ import annotations
 
 import gzip
+import pickle
 import re
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from io import BytesIO
 from logging import WARNING
 from pathlib import Path
 from typing import TYPE_CHECKING
+from urllib.parse import urlencode
 
 import pytest
+from twisted.python.failure import Failure
 
+from scrapy import signals
+from scrapy.exceptions import DropItem
 from scrapy.http import HtmlResponse, Request, Response, TextResponse, XmlResponse
 from scrapy.spiders import SitemapSpider
 from scrapy.utils.test import get_crawler
 from tests import tests_datadir
-from tests.spiders import RawResponseSpider
+from tests.spiders import MockServerSpider, RawResponseSpider
 from tests.utils.bases.spider import TestSpiderBase
 from tests.utils.crawl import crawl_items
 from tests.utils.decorators import coroutine_test

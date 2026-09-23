@@ -887,6 +887,43 @@ SitemapSpider
 
         Default is ``sitemap_alternate_links`` disabled.
 
+    .. attribute:: sitemap_incremental
+
+        Skip URLs whose successful previous crawl used the same or a newer
+        ``lastmod``. Set :setting:`JOBDIR` to keep the recorded versions
+        between runs.
+
+        .. versionadded:: VERSION
+
+        Date-only values are compared by day, while values with a timezone are
+        compared by instant. The two precisions are never compared with each
+        other; missing, invalid, incomparable, or timezone-less values cause
+        the URL to be crawled. When a URL appears more than once, its newest
+        valid candidate is used.
+
+        A version is recorded only after the page is downloaded, its callback
+        finishes, and every item produced by the callback has been processed
+        by the item pipelines. A regular :exc:`~scrapy.exceptions.DropItem`
+        counts as processed; a pipeline exception does not. ``lastmod`` in a
+        sitemap index applies only to the referenced sitemap.
+
+        Default is disabled.
+
+    .. attribute:: sitemap_refresh
+
+        Ignore stored ``lastmod`` versions for one run and schedule every URL
+        found in the sitemaps. After a page succeeds, its current candidate
+        version replaces the stored version. This also enables
+        :attr:`sitemap_incremental`.
+
+        .. versionadded:: VERSION
+
+        It can be set as a spider argument, for example::
+
+            scrapy crawl myspider -a sitemap_refresh=1
+
+        Default is disabled.
+
     .. method:: sitemap_filter(entries)
 
         This is a filter function that could be overridden to select sitemap entries

@@ -398,6 +398,81 @@ Default: ``False``
 
 Whether to enable HTTP/2 support in this handler.
 
+.. _warc-handler:
+
+WARCDownloadHandler
+-------------------
+
+.. versionadded:: VERSION
+
+.. autoclass:: scrapy.core.downloader.handlers._warc.WARCDownloadHandler
+
+| Supported schemes: ``http``, ``https``.
+| :ref:`Lazy <lazy-download-handlers>`: no.
+| :ref:`Requires asyncio support <using-asyncio>`: no.
+| :ref:`Requires a Twisted reactor <asyncio-without-reactor>`: no.
+
+This handler rebuilds responses from a local WARC 1.1 file instead of
+downloading them, which makes it possible to run a spider offline against
+the pages as they were when the file was recorded.
+
+If you want to use this handler you need to replace the default ones for
+the ``http`` and ``https`` schemes and set :setting:`WARC_FILE`:
+
+.. code-block:: python
+
+    DOWNLOAD_HANDLERS = {
+        "http": "scrapy.core.downloader.handlers._warc.WARCDownloadHandler",
+        "https": "scrapy.core.downloader.handlers._warc.WARCDownloadHandler",
+    }
+    WARC_FILE = "crawl.warc.gz"
+
+Uncompressed files and files with one gzip member per record are
+supported. When several records exist for the same URL, the newest one
+captured not later than :setting:`WARC_REPLAY_TIME` is used. Revisit
+records that reference the payload of another record are resolved.
+Requests for URLs without a matching record fail with
+:class:`~scrapy.core.downloader.handlers._warc.WARCRecordNotFoundError`
+instead of being downloaded from the network.
+
+Transfer encodings (e.g. chunked) are decoded by the handler, while
+content encodings (e.g. gzip) are left to
+:class:`~scrapy.downloadermiddlewares.httpcompression.HttpCompressionMiddleware`,
+as with any other download handler.
+
+.. setting:: WARC_FILE
+
+WARC_FILE
+^^^^^^^^^
+
+.. versionadded:: VERSION
+
+Default: ``None``
+
+Path of the WARC 1.1 file that this handler replays responses from.
+
+.. setting:: WARC_REPLAY_TIME
+
+WARC_REPLAY_TIME
+^^^^^^^^^^^^^^^^
+
+.. versionadded:: VERSION
+
+Default: ``None``
+
+Newest capture time, as an ISO 8601 datetime string, that this handler
+replays. If ``None``, the newest capture of each URL is used.
+
+.. autoexception:: scrapy.core.downloader.handlers._warc.WARCError
+
+.. autoexception:: scrapy.core.downloader.handlers._warc.WARCRecordNotFoundError
+
+.. autoexception:: scrapy.core.downloader.handlers._warc.WARCTruncatedRecordError
+
+.. autoexception:: scrapy.core.downloader.handlers._warc.WARCPayloadNotFoundError
+
+.. autoexception:: scrapy.core.downloader.handlers._warc.WARCReferenceLoopError
+
 Built-in non-HTTP download handlers reference
 =============================================
 

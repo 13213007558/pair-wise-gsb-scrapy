@@ -225,6 +225,8 @@ __all__ = [
     "TWISTED_REACTOR_ENABLED",
     "URLLENGTH_LIMIT",
     "USER_AGENT",
+    "WARC_FILE",
+    "WARC_REPLAY_TIME",
     "WARN_ON_GENERATOR_RETURN_VALUE",
 ]
 
@@ -615,6 +617,10 @@ TWISTED_REACTOR = "twisted.internet.asyncioreactor.AsyncioSelectorReactor"
 URLLENGTH_LIMIT = 2083
 
 USER_AGENT = f"Scrapy/{import_module('scrapy').__version__} (+https://scrapy.org)"
+
+WARC_FILE = None
+
+WARC_REPLAY_TIME = None
 
 WARN_ON_GENERATOR_RETURN_VALUE = True
 

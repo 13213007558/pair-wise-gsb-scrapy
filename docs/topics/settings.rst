@@ -2525,6 +2525,35 @@ where website owners can reach you, e.g. ``"MyProject
 (+https://example.com/bot)"``, so that they can ask you to adjust your crawler
 rather than block it.
 
+.. setting:: WARC_CUTOFF
+
+WARC_CUTOFF
+-----------
+
+.. versionadded:: VERSION
+
+Default: ``None``
+
+Scope: ``scrapy.core.downloader.handlers.warc``
+
+The latest capture date and time to replay from the WARC file, as an
+ISO 8601 string, e.g. ``"2024-05-01T00:00:00Z"``. If ``None``, all
+captures are eligible. See :ref:`warc-replay`.
+
+.. setting:: WARC_FILE
+
+WARC_FILE
+---------
+
+.. versionadded:: VERSION
+
+Default: ``None``
+
+Scope: ``scrapy.core.downloader.handlers.warc``
+
+The path of the WARC 1.1 file to rebuild responses from. See
+:ref:`warc-replay`.
+
 .. setting:: WARN_ON_GENERATOR_RETURN_VALUE
 
 WARN_ON_GENERATOR_RETURN_VALUE

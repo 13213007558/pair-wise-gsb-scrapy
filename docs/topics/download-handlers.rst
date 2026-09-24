@@ -459,3 +459,53 @@ This handler supports ``s3://bucket/path`` S3 URIs.
 It's implemented using the botocore_ library.
 
 .. _botocore: https://github.com/boto/botocore
+
+.. _warc-replay:
+
+Replaying responses from a WARC file
+====================================
+
+.. versionadded:: VERSION
+
+The WARC replay download handler rebuilds HTTP responses from a local
+WARC_ 1.1 file instead of downloading them from the network, which
+allows running a spider offline, e.g. to reproduce a past crawl after
+the target website has changed.
+
+.. _WARC: https://iipc.github.io/warc-specifications/specifications/warc-format/warc-1.1/
+
+To enable it, point the ``http`` and ``https`` schemes to
+:class:`~scrapy.core.downloader.handlers.warc.WarcDownloadHandler`
+through the :setting:`DOWNLOAD_HANDLERS` setting, set
+:setting:`WARC_FILE` to the path of the WARC file and, optionally,
+:setting:`WARC_CUTOFF` to the latest capture date and time to replay:
+
+.. code-block:: python
+
+    DOWNLOAD_HANDLERS = {
+        "http": "scrapy.core.downloader.handlers.warc.WarcDownloadHandler",
+        "https": "scrapy.core.downloader.handlers.warc.WarcDownloadHandler",
+    }
+    WARC_FILE = "archive.warc.gz"
+    WARC_CUTOFF = "2024-05-01T00:00:00Z"
+
+Both uncompressed files and per-record gzip files (the usual
+:file:`.warc.gz` layout) are supported, including ``response`` records
+and ``revisit`` records that refer to the payload of an earlier record.
+
+When a URL has been captured more than once, the most recent capture
+not later than :setting:`WARC_CUTOFF` is used; captures with the same
+date and time are resolved in file order. Only the records being
+replayed are read, and responses are rebuilt with their original URL,
+status, headers (including duplicate headers) and payload, so they go
+through the usual response processing, e.g. response encoding
+detection and the :ref:`HTTP compression middleware <http-compression>`.
+
+Requests for URLs without a matching capture, as well as truncated,
+malformed or otherwise unusable records, raise
+:class:`~scrapy.core.downloader.handlers.warc.WarcReplayError`; no
+request is ever sent to the network.
+
+.. autoclass:: scrapy.core.downloader.handlers.warc.WarcDownloadHandler
+
+.. autoexception:: scrapy.core.downloader.handlers.warc.WarcReplayError

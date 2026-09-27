@@ -8,19 +8,22 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
 import logging
 import re
 import sys
 import warnings
 from abc import ABC, abstractmethod
-from collections.abc import Callable
+from collections import OrderedDict
+from collections.abc import Callable, Coroutine
 from datetime import datetime, timezone
 from pathlib import Path, PureWindowsPath
 from tempfile import NamedTemporaryFile
 from typing import IO, TYPE_CHECKING, Any, Protocol, TypeAlias, cast
-from urllib.parse import unquote, urlparse
+from urllib.parse import quote, unquote, urlparse
 from uuid import uuid4
 
+from itemadapter import ItemAdapter
 from twisted.internet.defer import Deferred, DeferredList
 from w3lib.url import file_uri_to_path
 from zope.interface import Interface
@@ -79,6 +82,20 @@ def apply_uri_params(uri_template: str, uri_params: dict[str, Any]) -> str:
 UriParamsCallableT: TypeAlias = Callable[
     [dict[str, Any], Spider], dict[str, Any] | None
 ]
+
+# Default maximum number of partitions with an open file at the same time in
+# a partitioned feed.
+_DEFAULT_MAX_ACTIVE_PARTITIONS = 16
+
+
+def _encode_partition_value(value: str) -> str:
+    """Return *value* encoded so that it is safe to use as a single path
+    segment, i.e. it cannot contain path separators or be ``.`` or ``..``.
+    """
+    encoded = quote(value, safe="")
+    if encoded in ("", ".", ".."):
+        raise ValueError(f"Cannot use {value!r} as a partition path segment")
+    return encoded
 
 
 class ItemFilter:
@@ -484,6 +501,165 @@ class FeedSlot:
             self._exporting = False
 
 
+class _PartitionManager:
+    """Route the items of one partitioned feed into per-partition slots.
+
+    The partition of an item is the value of a configured item field. At
+    most *max_active* partitions have an open file at any given moment;
+    reaching a partition without an open file evicts the least recently
+    used one and, if that partition later gets more items, a new segment
+    is opened for it. Segment URIs come from the feed URI template,
+    substituting ``%(partition)s`` and ``%(segment)s``, so segment names
+    are never reused and existing files are never overwritten.
+    """
+
+    def __init__(
+        self,
+        *,
+        exporter: FeedExporter,
+        uri: str,
+        feed_options: dict[str, Any],
+        spider: Spider,
+        uri_params: dict[str, Any],
+    ) -> None:
+        self.exporter: FeedExporter = exporter
+        self.uri: str = uri
+        self.feed_options: dict[str, Any] = feed_options
+        self.spider: Spider = spider
+        self.uri_params: dict[str, Any] = uri_params
+        partition = feed_options["partition"]
+        self.field: str = partition["field"]
+        max_active = partition.get("max_active", _DEFAULT_MAX_ACTIVE_PARTITIONS)
+        self.max_active: int = sys.maxsize if max_active is None else int(max_active)
+        allowed = partition.get("allowed")
+        self.allowed: set[str] | None = (
+            {str(value) for value in allowed} if allowed is not None else None
+        )
+        self.quarantine: str | None = partition.get("quarantine")
+        template = file_uri_to_path(uri) if uri.startswith("file:") else uri
+        self.manifest_path: str = partition.get("manifest") or str(
+            Path(template.split("%(")[0]) / "feed-manifest.json"
+        )
+        self.filter: ItemFilter = exporter.filters[uri]
+        self._active: OrderedDict[str, FeedSlot] = OrderedDict()
+        self._segments: dict[str, int] = {}
+        self._records_by_slot: dict[FeedSlot, dict[str, Any]] = {}
+        self._partitions: list[dict[str, Any]] = []
+        self._entries: dict[str, dict[str, Any]] = {}
+
+    def export_item(self, item: Any) -> None:
+        key, encoded = self._partition_key(item)
+        slot = self._active.get(key)
+        if slot is None:
+            slot = self._open_slot(key, encoded)
+        else:
+            self._active.move_to_end(key)
+        slot.start_exporting()
+        assert slot.exporter
+        slot.exporter.export_item(item)
+        slot.itemcount += 1
+
+    def close(self) -> None:
+        """Schedule the closing of all active slots."""
+        for slot in self._active.values():
+            self._schedule_slot_close(slot)
+        self._active.clear()
+
+    def write_manifest(self) -> None:
+        """Write the manifest listing every partition and segment of the
+        feed, with item counts, sizes and success status."""
+        path = Path(self.manifest_path)
+        if not path.parent.exists():
+            path.parent.mkdir(parents=True)
+        manifest = {"feed": self.uri, "partitions": self._partitions}
+        path.write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
+
+    def _partition_key(self, item: Any) -> tuple[str, str]:
+        """Return the partition value of *item* and its path-safe encoding,
+        routing missing or disallowed values to the quarantine partition."""
+        value = ItemAdapter(item).get(self.field)
+        key = str(value) if isinstance(value, (str, int, float)) else ""
+        if key and self.allowed is not None and key not in self.allowed:
+            key = ""
+        if key:
+            try:
+                return key, _encode_partition_value(key)
+            except ValueError:
+                pass
+        if self.quarantine is None:
+            raise ValueError(
+                f"Item field {self.field!r} has value {value!r}, which is "
+                f"missing or not allowed, and no quarantine partition is "
+                f"configured for feed {self.uri!r}"
+            )
+        return self.quarantine, _encode_partition_value(self.quarantine)
+
+    def _open_slot(self, key: str, encoded: str) -> FeedSlot:
+        while len(self._active) >= self.max_active:
+            _, evicted = self._active.popitem(last=False)
+            self._schedule_slot_close(evicted)
+        segment = self._segments.get(key, 0) + 1
+        self._segments[key] = segment
+        uri = self._segment_uri(encoded, segment)
+        slot = self.exporter._start_new_batch(
+            batch_id=segment,
+            uri=uri,
+            feed_options=self.feed_options,
+            spider=self.spider,
+            uri_template=self.uri,
+        )
+        entry = self._entries.get(key)
+        if entry is None:
+            entry = {"partition": key, "segments": []}
+            self._entries[key] = entry
+            self._partitions.append(entry)
+        record: dict[str, Any] = {
+            "segment": segment,
+            "uri": uri,
+            "itemcount": 0,
+            "bytes": None,
+            "success": False,
+        }
+        entry["segments"].append(record)
+        self._records_by_slot[slot] = record
+        self._active[key] = slot
+        return slot
+
+    def _segment_uri(self, encoded: str, segment: int) -> str:
+        # A file: URI is URL-decoded by the storage, so the partition value
+        # must be encoded once more to stay encoded in the final file name.
+        partition = quote(encoded, safe="") if self.uri.startswith("file:") else encoded
+        uri = apply_uri_params(
+            self.uri, {**self.uri_params, "partition": partition, "segment": segment}
+        )
+        if "%(segment)" not in self.uri:
+            head, slash, name = uri.rpartition("/")
+            stem, dot, ext = name.rpartition(".")
+            if not dot:
+                stem, ext = ext, ""
+            uri = f"{head}{slash}{stem}.{segment:04d}{dot}{ext}"
+        return uri
+
+    def _schedule_slot_close(self, slot: FeedSlot) -> None:
+        record = self._records_by_slot[slot]
+        record["itemcount"] = slot.itemcount
+        self.exporter._schedule_close_task(self._record_close(slot, record))
+
+    async def _record_close(self, slot: FeedSlot, record: dict[str, Any]) -> None:
+        record["success"] = await self.exporter._close_slot(slot, self.spider)
+        record["bytes"] = self._segment_size(slot)
+
+    @staticmethod
+    def _segment_size(slot: FeedSlot) -> int | None:
+        storage = slot.storage
+        if isinstance(storage, FileFeedStorage):
+            try:
+                return Path(storage.path).stat().st_size
+            except OSError:  # pragma: no cover
+                return None
+        return None
+
+
 class FeedExporter:
     @classmethod
     def from_crawler(cls, crawler: Crawler) -> Self:
@@ -499,7 +675,8 @@ class FeedExporter:
         self.feeds: dict[str, dict[str, Any]] = {}
         self.slots: list[FeedSlot] = []
         self.filters: dict[str, ItemFilter] = {}
-        self._pending_close_tasks: list[asyncio.Task[None] | Deferred[None]] = []
+        self._partition_managers: list[_PartitionManager] = []
+        self._pending_close_tasks: list[asyncio.Task[Any] | Deferred[Any]] = []
 
         if not self.settings["FEEDS"] and not self.settings["FEED_URI"]:
             raise NotConfigured
@@ -546,12 +723,25 @@ class FeedExporter:
                 raise NotConfigured
             if not self._settings_are_valid():
                 raise NotConfigured
+            if not self._partition_settings_are_valid():
+                raise NotConfigured
             if not self._exporter_supported(feed_options["format"]):
                 raise NotConfigured
 
     def open_spider(self, spider: Spider) -> None:
         for uri, feed_options in self.feeds.items():
             uri_params = self._get_uri_params(spider, feed_options["uri_params"])
+            if "partition" in feed_options:
+                self._partition_managers.append(
+                    _PartitionManager(
+                        exporter=self,
+                        uri=uri,
+                        feed_options=feed_options,
+                        spider=spider,
+                        uri_params=uri_params,
+                    )
+                )
+                continue
             self.slots.append(
                 self._start_new_batch(
                     batch_id=1,
@@ -565,6 +755,8 @@ class FeedExporter:
     async def close_spider(self, spider: Spider) -> None:
         for slot in self.slots:
             self._schedule_slot_close(slot, spider)
+        for manager in self._partition_managers:
+            manager.close()
 
         if self._pending_close_tasks:  # pragma: no branch
             if is_asyncio_available():
@@ -576,17 +768,24 @@ class FeedExporter:
                     cast("list[Deferred[None]]", list(self._pending_close_tasks))
                 )
 
+        for manager in self._partition_managers:
+            manager.write_manifest()
+
         # Send FEED_EXPORTER_CLOSED signal
         await self.crawler.signals.send_catch_log_async(signals.feed_exporter_closed)
 
     def _schedule_slot_close(
         self, slot: FeedSlot, spider: Spider
-    ) -> asyncio.Task[None] | Deferred[None]:
+    ) -> asyncio.Task[Any] | Deferred[Any]:
         """Start closing the slot without waiting for it to finish, keeping
         track of the pending work so that it can be awaited in
         :meth:`close_spider` if it hasn't finished by then."""
-        aw: asyncio.Task[None] | Deferred[None]
-        coro = self._close_slot(slot, spider)
+        return self._schedule_close_task(self._close_slot(slot, spider))
+
+    def _schedule_close_task(
+        self, coro: Coroutine[Any, Any, Any]
+    ) -> asyncio.Task[Any] | Deferred[Any]:
+        aw: asyncio.Task[Any] | Deferred[Any]
         if is_asyncio_available():
             aw = asyncio.create_task(coro)
             self._pending_close_tasks.append(aw)
@@ -609,7 +808,7 @@ class FeedExporter:
             return slot_.file.file
         return slot_.file
 
-    async def _close_slot(self, slot: FeedSlot, spider: Spider) -> None:
+    async def _close_slot(self, slot: FeedSlot, spider: Spider) -> bool:
 
         if slot.itemcount:
             # Normal case
@@ -620,7 +819,7 @@ class FeedExporter:
             slot.finish_exporting()
         else:
             # In this case, the file is not stored, so no processing is required.
-            return
+            return False
 
         logmsg = f"{slot.format} feed ({slot.itemcount} items) in: {slot.uri}"
         slot_type = type(slot.storage).__name__
@@ -633,6 +832,7 @@ class FeedExporter:
                 extra={"spider": spider},
             )
             self.crawler.stats.inc_value(f"feedexport/failed_count/{slot_type}")
+            return False
         else:
             logger.info("Stored %s", logmsg, extra={"spider": spider})
             self.crawler.stats.inc_value(f"feedexport/success_count/{slot_type}")
@@ -640,6 +840,7 @@ class FeedExporter:
         await self.crawler.signals.send_catch_log_async(
             signals.feed_slot_closed, slot=slot
         )
+        return True
 
     def _start_new_batch(
         self,
@@ -708,6 +909,9 @@ class FeedExporter:
             else:
                 slots.append(slot)
         self.slots = slots
+        for manager in self._partition_managers:
+            if manager.filter.accepts(item):
+                manager.export_item(item)
 
     def _load_components(self, setting_prefix: str) -> dict[str, Any]:
         conf = without_none_values(
@@ -730,6 +934,65 @@ class FeedExporter:
                 "feed URI; set it explicitly with the 'format' key"
             )
         return False
+
+    def _partition_settings_are_valid(self) -> bool:
+        """If the 'partition' feed option is set, the feed URI must contain
+        %(partition)s, and only local file storage and JSON Lines output are
+        supported."""
+        for uri, feed_options in self.feeds.items():
+            partition = feed_options.get("partition")
+            if partition is None:
+                continue
+            if not re.search(r"%\(partition\)", uri):
+                logger.error(
+                    f"%(partition)s must be in the feed URI ({uri}) if the "
+                    "'partition' feed option is set."
+                )
+                return False
+            if feed_options["batch_item_count"]:
+                logger.error(
+                    "The 'partition' feed option cannot be combined with "
+                    f"batch_item_count (feed URI: {uri})."
+                )
+                return False
+            if feed_options["format"] not in ("jsonlines", "jsonl", "jl"):
+                logger.error(
+                    "The 'partition' feed option only supports the JSON "
+                    f"Lines format, not {feed_options['format']!r} "
+                    f"(feed URI: {uri})."
+                )
+                return False
+            if urlparse(uri).scheme not in ("", "file"):
+                logger.error(
+                    "The 'partition' feed option only supports local file "
+                    f"storage (feed URI: {uri})."
+                )
+                return False
+            if not partition.get("field"):
+                logger.error(
+                    "The 'partition' feed option requires a 'field' key "
+                    f"(feed URI: {uri})."
+                )
+                return False
+            max_active = partition.get("max_active")
+            if max_active is not None and int(max_active) < 1:
+                logger.error(
+                    "The 'max_active' partition option must be greater "
+                    f"than 0 (feed URI: {uri})."
+                )
+                return False
+            quarantine = partition.get("quarantine")
+            if quarantine is not None:
+                try:
+                    _encode_partition_value(str(quarantine))
+                except ValueError:
+                    logger.error(
+                        "The 'quarantine' partition option must be usable "
+                        f"as a path segment, got {quarantine!r} "
+                        f"(feed URI: {uri})."
+                    )
+                    return False
+        return True
 
     def _settings_are_valid(self) -> bool:
         """

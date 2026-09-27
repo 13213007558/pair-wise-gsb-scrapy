@@ -371,6 +371,75 @@ ItemFilter
    :members:
 
 
+.. _feed-partitions:
+
+Partitioned exports
+===================
+
+A feed can split its items into per-partition files based on the value of
+an item field, using the ``partition`` :ref:`feed option <feed-options>`.
+Each item is exported to exactly one partition, and items are written to
+their partition file in the order they are scraped.
+
+.. versionadded:: VERSION
+
+The feed URI of a partitioned feed must contain the ``%(partition)s``
+placeholder, which is replaced by the URL-encoded partition value, so a
+partition value can never add path separators or ``..`` segments to the
+resulting file path.
+
+The ``partition`` feed option is a dictionary with the following keys:
+
+-   ``field`` (mandatory): name of the item field whose value defines the
+    partition of each item.
+
+-   ``max_active``: maximum number of partitions with an open file at the
+    same time (16 by default, ``None`` for no limit). When the limit is
+    reached, the least recently used partition is closed, and if it later
+    receives more items a new *segment* file is opened for it. Segment
+    file names are never reused, so existing content is never
+    overwritten: use the ``%(segment)s`` placeholder (e.g.
+    ``%(segment)04d``) in the feed URI to choose where the segment number
+    goes, or a ``.NNNN`` suffix is added before the file extension.
+
+-   ``allowed``: optional list of allowed partition values.
+
+-   ``quarantine``: partition value to use for items whose field is
+    missing, empty, not allowed or not usable as a path segment. If not
+    set, such items log an error instead.
+
+-   ``manifest``: path of the manifest file written when the spider
+    closes. By default it is :file:`feed-manifest.json` in the directory
+    of the feed URI.
+
+The manifest is a JSON object with a ``partitions`` list where every
+entry has a ``partition`` value and a ``segments`` list. Every segment
+entry includes its ``uri``, ``itemcount``, ``bytes`` and ``success``
+status. Segments that fail to be stored have ``success`` set to
+``false``.
+
+Partitioned feeds currently require :ref:`local file storage
+<topics-feed-storage-fs>` and the :ref:`JSON Lines <topics-feed-format>`
+format, and cannot be combined with ``batch_item_count``.
+
+For instance:
+
+.. code-block:: python
+
+    {
+        "feeds/%(partition)s-%(segment)04d.jsonl": {
+            "format": "jsonlines",
+            "partition": {
+                "field": "region",
+                "max_active": 100,
+                "allowed": ["eu", "us"],
+                "quarantine": "invalid",
+                "manifest": "feeds/manifest.json",
+            },
+        },
+    }
+
+
 .. _post-processing:
 
 Post-Processing
@@ -553,6 +622,9 @@ as a fallback value if that key is not provided for a specific feed definition:
 -   ``postprocessing``: list of :ref:`plugins <post-processing>` to use for post-processing.
 
     The plugins will be used in the order of the list passed.
+
+-   ``partition``: a :ref:`partitioning configuration <feed-partitions>`
+    to split the feed into per-partition files based on an item field.
 
 .. setting:: FEED_EXPORT_ENCODING
 

@@ -1225,6 +1225,339 @@ class TestFeedExport(TestFeedExportBase):
         assert not Storage.file_was_closed
 
 
+class RegionItem(scrapy.Item):
+    region = scrapy.Field()
+    n = scrapy.Field()
+
+
+class TestFeedExportPartition(TestFeedExportBase):
+    """Tests for partitioned feed exports (the 'partition' feed option)."""
+
+    async def run_and_export(
+        self, spider_cls: type[Spider], settings: dict[str, Any]
+    ) -> dict[str, Any]:
+        spider_cls.start_urls = [self.mockserver.url("/")]
+        crawler = get_crawler(spider_cls, settings)
+        await crawler.crawl_async()
+        return {}
+
+    @staticmethod
+    def _read_jsonl(path: Path) -> list[dict[str, Any]]:
+        return [json.loads(line) for line in path.read_text().splitlines()]
+
+    async def run_partitioned(
+        self,
+        items: Iterable[Any],
+        partition: dict[str, Any],
+        *,
+        uri_template: str = "%(partition)s-%(segment)04d.jsonl",
+        use_file_uri: bool = False,
+        set_manifest: bool = True,
+        extra_feed_options: dict[str, Any] | None = None,
+        extra_feeds: dict[str, Any] | None = None,
+        extra_settings: dict[str, Any] | None = None,
+    ) -> tuple[Path, Path]:
+        class TestSpider(scrapy.Spider):
+            name = "testspider"
+
+            def parse(self, response):
+                yield from items
+
+        feed_dir = Path(self.temp_dir, "feeds")
+        if "manifest" in partition:
+            manifest_path = Path(partition["manifest"])
+        elif set_manifest:
+            manifest_path = Path(self.temp_dir, "manifest.json")
+            partition = {**partition, "manifest": str(manifest_path)}
+        else:
+            manifest_path = feed_dir / "feed-manifest.json"
+        feed_options: dict[str, Any] = {
+            "format": "jsonlines",
+            "partition": partition,
+            **(extra_feed_options or {}),
+        }
+        if use_file_uri:
+            feed_uri = f"{feed_dir.as_uri()}/{uri_template}"
+        else:
+            feed_uri = str(feed_dir / uri_template)
+        feeds: dict[str, Any] = {feed_uri: feed_options}
+        feeds.update(extra_feeds or {})
+        settings: dict[str, Any] = {"FEEDS": feeds}
+        settings.update(extra_settings or {})
+        await self.run_and_export(TestSpider, settings)
+        return feed_dir, manifest_path
+
+    @coroutine_test
+    async def test_cycling_partitions_create_segments(self):
+        items = [
+            {"region": "A", "n": 1},
+            {"region": "B", "n": 1},
+            {"region": "A", "n": 2},
+            {"region": "C", "n": 1},
+            {"region": "B", "n": 2},
+            {"region": "A", "n": 3},
+        ]
+        feed_dir, manifest_path = await self.run_partitioned(
+            items,
+            {"field": "region", "max_active": 2},
+        )
+        expected = {
+            "A-0001.jsonl": [{"region": "A", "n": 1}, {"region": "A", "n": 2}],
+            "A-0002.jsonl": [{"region": "A", "n": 3}],
+            "B-0001.jsonl": [{"region": "B", "n": 1}],
+            "B-0002.jsonl": [{"region": "B", "n": 2}],
+            "C-0001.jsonl": [{"region": "C", "n": 1}],
+        }
+        assert sorted(p.name for p in feed_dir.iterdir()) == sorted(expected)
+        for name, rows in expected.items():
+            assert self._read_jsonl(feed_dir / name) == rows
+
+        manifest = json.loads(manifest_path.read_text())
+        partitions = {p["partition"]: p["segments"] for p in manifest["partitions"]}
+        assert set(partitions) == {"A", "B", "C"}
+        assert [s["segment"] for s in partitions["A"]] == [1, 2]
+        assert [s["segment"] for s in partitions["B"]] == [1, 2]
+        assert [s["segment"] for s in partitions["C"]] == [1]
+        for key, segments in partitions.items():
+            for segment in segments:
+                path = feed_dir / f"{key}-{segment['segment']:04d}.jsonl"
+                assert segment["uri"] == str(path)
+                assert segment["itemcount"] == len(self._read_jsonl(path))
+                assert segment["bytes"] == path.stat().st_size
+                assert segment["success"] is True
+
+    @coroutine_test
+    async def test_quarantine_partition(self):
+        items = [
+            {"region": "A", "n": 1},
+            {"n": 2},  # missing field
+            {"region": "Z", "n": 3},  # not allowed
+            {"region": "", "n": 4},  # empty value
+            {"region": "B", "n": 5},
+            {"region": ["x"], "n": 6},  # non-scalar value
+        ]
+        feed_dir, manifest_path = await self.run_partitioned(
+            items,
+            {"field": "region", "allowed": ["A", "B"], "quarantine": "invalid"},
+        )
+        assert self._read_jsonl(feed_dir / "invalid-0001.jsonl") == [
+            {"n": 2},
+            {"region": "Z", "n": 3},
+            {"region": "", "n": 4},
+            {"region": ["x"], "n": 6},
+        ]
+        assert self._read_jsonl(feed_dir / "A-0001.jsonl") == [{"region": "A", "n": 1}]
+        assert self._read_jsonl(feed_dir / "B-0001.jsonl") == [{"region": "B", "n": 5}]
+        manifest = json.loads(manifest_path.read_text())
+        partitions = {p["partition"]: p["segments"] for p in manifest["partitions"]}
+        assert partitions["invalid"][0]["itemcount"] == 4
+
+    @coroutine_test
+    async def test_invalid_value_without_quarantine_logs_error(
+        self, caplog: pytest.LogCaptureFixture
+    ):
+        items = [{"region": "A", "n": 1}, {"n": 2}, {"region": "A", "n": 3}]
+        with caplog.at_level(logging.ERROR):
+            feed_dir, manifest_path = await self.run_partitioned(
+                items, {"field": "region"}
+            )
+        assert any(
+            isinstance(record.exc_info[1], ValueError)
+            and "no quarantine partition is configured" in str(record.exc_info[1])
+            for record in caplog.records
+            if record.exc_info
+        )
+        assert self._read_jsonl(feed_dir / "A-0001.jsonl") == [
+            {"region": "A", "n": 1},
+            {"region": "A", "n": 3},
+        ]
+        manifest = json.loads(manifest_path.read_text())
+        partitions = {p["partition"] for p in manifest["partitions"]}
+        assert partitions == {"A"}
+
+    @coroutine_test
+    async def test_partition_values_cannot_escape_feed_dir(self):
+        items = [
+            {"region": "../evil", "n": 1},
+            {"region": "a/b", "n": 2},
+            {"region": "..", "n": 3},
+        ]
+        feed_dir, _ = await self.run_partitioned(
+            items,
+            {"field": "region", "quarantine": "invalid"},
+        )
+        assert self._read_jsonl(feed_dir / "..%2Fevil-0001.jsonl") == [
+            {"region": "../evil", "n": 1}
+        ]
+        assert self._read_jsonl(feed_dir / "a%2Fb-0001.jsonl") == [
+            {"region": "a/b", "n": 2}
+        ]
+        assert self._read_jsonl(feed_dir / "invalid-0001.jsonl") == [
+            {"region": "..", "n": 3}
+        ]
+        # nothing was written outside the feed directory
+        assert sorted(p.name for p in Path(self.temp_dir).iterdir()) == [
+            "feeds",
+            "manifest.json",
+        ]
+
+    @coroutine_test
+    async def test_file_uri_partition_values_stay_encoded(self):
+        items = [{"region": "a/b", "n": 1}, {"region": "../evil", "n": 2}]
+        feed_dir, _ = await self.run_partitioned(
+            items,
+            {"field": "region"},
+            use_file_uri=True,
+        )
+        assert self._read_jsonl(feed_dir / "a%2Fb-0001.jsonl") == [
+            {"region": "a/b", "n": 1}
+        ]
+        assert self._read_jsonl(feed_dir / "..%2Fevil-0001.jsonl") == [
+            {"region": "../evil", "n": 2}
+        ]
+        assert sorted(p.name for p in Path(self.temp_dir).iterdir()) == [
+            "feeds",
+            "manifest.json",
+        ]
+
+    @coroutine_test
+    async def test_segment_suffix_without_placeholder(self):
+        items = [
+            {"region": "A", "n": 1},
+            {"region": "B", "n": 1},
+            {"region": "A", "n": 2},
+        ]
+        feed_dir, _ = await self.run_partitioned(
+            items,
+            {"field": "region", "max_active": 1},
+            uri_template="%(partition)s.jsonl",
+        )
+        assert self._read_jsonl(feed_dir / "A.0001.jsonl") == [{"region": "A", "n": 1}]
+        assert self._read_jsonl(feed_dir / "B.0001.jsonl") == [{"region": "B", "n": 1}]
+        assert self._read_jsonl(feed_dir / "A.0002.jsonl") == [{"region": "A", "n": 2}]
+
+    @coroutine_test
+    async def test_failed_segment_is_not_marked_complete(self):
+        items = [{"region": "A", "n": 1}]
+        _, manifest_path = await self.run_partitioned(
+            items,
+            {"field": "region"},
+            extra_settings={
+                "FEED_STORAGES": {
+                    "": FailingBlockingFeedStorage,
+                    "file": FailingBlockingFeedStorage,
+                }
+            },
+        )
+        manifest = json.loads(manifest_path.read_text())
+        segments = manifest["partitions"][0]["segments"]
+        assert len(segments) == 1
+        assert segments[0]["itemcount"] == 1
+        assert segments[0]["success"] is False
+        assert segments[0]["bytes"] is None
+
+    @coroutine_test
+    async def test_item_filter_is_applied(self):
+        items = [
+            RegionItem({"region": "A", "n": 1}),
+            {"region": "B", "n": 2},
+        ]
+        feed_dir, manifest_path = await self.run_partitioned(
+            items,
+            {"field": "region"},
+            extra_feed_options={"item_classes": ["tests.test_feedexport.RegionItem"]},
+        )
+        assert self._read_jsonl(feed_dir / "A-0001.jsonl") == [{"region": "A", "n": 1}]
+        assert not (feed_dir / "B-0001.jsonl").exists()
+        manifest = json.loads(manifest_path.read_text())
+        partitions = {p["partition"] for p in manifest["partitions"]}
+        assert partitions == {"A"}
+
+    @coroutine_test
+    async def test_partitioned_feed_alongside_regular_feed(self):
+        items = [{"region": "A", "n": 1}, {"region": "B", "n": 2}]
+        plain_path = Path(self.temp_dir, "plain.jsonl")
+        feed_dir, _ = await self.run_partitioned(
+            items,
+            {"field": "region"},
+            extra_feeds={str(plain_path): {"format": "jsonlines"}},
+        )
+        assert self._read_jsonl(feed_dir / "A-0001.jsonl") == [{"region": "A", "n": 1}]
+        assert self._read_jsonl(feed_dir / "B-0001.jsonl") == [{"region": "B", "n": 2}]
+        assert self._read_jsonl(plain_path) == items
+
+    @coroutine_test
+    async def test_default_manifest_location(self):
+        items = [{"region": "A", "n": 1}]
+        feed_dir, manifest_path = await self.run_partitioned(
+            items,
+            {"field": "region"},
+            set_manifest=False,
+        )
+        assert manifest_path.parent == feed_dir
+        manifest = json.loads(manifest_path.read_text())
+        partitions = {p["partition"] for p in manifest["partitions"]}
+        assert partitions == {"A"}
+
+    @coroutine_test
+    async def test_manifest_in_nested_directory(self):
+        items = [{"region": "A", "n": 1}]
+        nested = Path(self.temp_dir, "nested", "deeper")
+        _, manifest_path = await self.run_partitioned(
+            items,
+            {"field": "region", "manifest": str(nested / "manifest.json")},
+        )
+        assert manifest_path.parent == nested
+        manifest = json.loads(manifest_path.read_text())
+        partitions = {p["partition"] for p in manifest["partitions"]}
+        assert partitions == {"A"}
+
+    @coroutine_test
+    async def test_unlimited_active_partitions(self):
+        items = [
+            {"region": "A", "n": 1},
+            {"region": "B", "n": 1},
+            {"region": "C", "n": 1},
+            {"region": "A", "n": 2},
+        ]
+        feed_dir, manifest_path = await self.run_partitioned(
+            items,
+            {"field": "region", "max_active": None},
+        )
+        assert self._read_jsonl(feed_dir / "A-0001.jsonl") == [
+            {"region": "A", "n": 1},
+            {"region": "A", "n": 2},
+        ]
+        # no partition was evicted, so there is a single segment per partition
+        manifest = json.loads(manifest_path.read_text())
+        partitions = {p["partition"]: p["segments"] for p in manifest["partitions"]}
+        assert all(len(segments) == 1 for segments in partitions.values())
+
+    @pytest.mark.parametrize(
+        ("uri", "partition", "feed_extra"),
+        [
+            ("out.jsonl", {"field": "region"}, {}),
+            ("out-%(partition)s.jsonl", {}, {}),
+            ("out-%(partition)s.json", {"field": "region"}, {}),
+            ("out-%(partition)s.jsonl", {"field": "region", "max_active": 0}, {}),
+            ("out-%(partition)s.jsonl", {"field": "region", "quarantine": ".."}, {}),
+            ("ftp://example.com/%(partition)s.jsonl", {"field": "region"}, {}),
+            (
+                "out-%(partition)s-%(batch_id)d.jsonl",
+                {"field": "region"},
+                {"batch_item_count": 2},
+            ),
+        ],
+    )
+    def test_invalid_partition_settings(self, uri, partition, feed_extra):
+        settings: dict[str, Any] = {
+            "FEEDS": {uri: {"partition": partition, **feed_extra}},
+        }
+        crawler = get_crawler(settings_dict=settings)
+        with pytest.raises(NotConfigured):
+            build_from_crawler(FeedExporter, crawler)
+
+
 # Test that the FeedExporer sends the feed_exporter_closed and feed_slot_closed signals
 class TestFeedExporterSignals:
     items = [

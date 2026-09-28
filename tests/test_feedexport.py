@@ -5,6 +5,7 @@ import json
 import logging
 import marshal
 import pickle
+import shutil
 import tempfile
 from logging import getLogger
 from pathlib import Path
@@ -18,7 +19,7 @@ from w3lib.url import file_uri_to_path
 import scrapy
 from scrapy import Spider, signals
 from scrapy.exceptions import NotConfigured
-from scrapy.exporters import CsvItemExporter, JsonItemExporter
+from scrapy.exporters import CsvItemExporter, JsonItemExporter, JsonLinesItemExporter
 from scrapy.extensions.feedexport import (
     BlockingFeedStorage,
     FeedExporter,
@@ -140,6 +141,20 @@ class ExceptionJsonItemExporter(JsonItemExporter):
     """JsonItemExporter that throws an exception every time export_item is called."""
 
     def export_item(self, _):
+        raise RuntimeError("foo")
+
+
+class ExceptionJsonLinesItemExporter(JsonLinesItemExporter):
+    """JsonLinesItemExporter that throws an exception every time export_item is called."""
+
+    def export_item(self, _):
+        raise RuntimeError("foo")
+
+
+class ExceptionOnFinishJsonLinesItemExporter(JsonLinesItemExporter):
+    """JsonLinesItemExporter that throws an exception when finish_exporting is called."""
+
+    def finish_exporting(self):
         raise RuntimeError("foo")
 
 
@@ -1392,6 +1407,306 @@ class TestFeedExportInit:
         crawler = get_crawler(settings_dict=settings)
         exporter = build_from_crawler(FeedExporter, crawler)
         assert isinstance(exporter, FeedExporter)
+
+
+class TestFeedExportPartitions:
+    """Feeds partitioned by an item field into per-partition segment files."""
+
+    def setup_method(self):
+        self.temp_dir = tempfile.mkdtemp()
+
+    def teardown_method(self):
+        shutil.rmtree(self.temp_dir, ignore_errors=True)
+
+    def _make_exporter(
+        self,
+        feed_options: dict[str, Any],
+        extra_settings: dict[str, Any] | None = None,
+    ) -> tuple[FeedExporter, Spider, Path]:
+        base_dir = Path(self.temp_dir) / "out"
+        settings = {
+            "FEEDS": {
+                printf_escape(path_to_url(base_dir)): feed_options,
+            },
+        }
+        settings.update(extra_settings or {})
+        crawler = get_crawler(settings_dict=settings)
+        feed_exporter = build_from_crawler(FeedExporter, crawler)
+        spider = scrapy.Spider.from_crawler(crawler, "default")
+        feed_exporter.open_spider(spider)
+        return feed_exporter, spider, base_dir
+
+    async def _run_exporter(
+        self,
+        items: Iterable[Any],
+        feed_options: dict[str, Any],
+        extra_settings: dict[str, Any] | None = None,
+    ) -> Path:
+        feed_exporter, spider, base_dir = self._make_exporter(
+            feed_options, extra_settings
+        )
+        for item in items:
+            feed_exporter.item_scraped(item, spider)
+        await feed_exporter.close_spider(spider)
+        return base_dir
+
+    @staticmethod
+    def _read_segment(path: Path) -> list[dict[str, Any]]:
+        return [json.loads(line) for line in path.read_text().splitlines()]
+
+    @staticmethod
+    def _read_manifest(base_dir: Path) -> dict[str, Any]:
+        manifest: dict[str, Any] = json.loads((base_dir / "manifest.json").read_text())
+        return manifest
+
+    @coroutine_test
+    async def test_items_routed_to_partitions(self):
+        items = [
+            {"region": "A", "n": 1},
+            {"region": "B", "n": 2},
+            {"region": "A", "n": 3},
+            {"region": "B", "n": 4},
+        ]
+        base_dir = await self._run_exporter(
+            items, {"format": "jsonlines", "partitions": {"field": "region"}}
+        )
+        assert self._read_segment(base_dir / "A" / "part-00001.jl") == [
+            {"region": "A", "n": 1},
+            {"region": "A", "n": 3},
+        ]
+        assert self._read_segment(base_dir / "B" / "part-00001.jl") == [
+            {"region": "B", "n": 2},
+            {"region": "B", "n": 4},
+        ]
+        manifest = self._read_manifest(base_dir)
+        assert set(manifest["partitions"]) == {"A", "B"}
+        partition = manifest["partitions"]["A"]
+        assert partition["item_count"] == 2
+        (segment,) = partition["segments"]
+        assert segment["item_count"] == 2
+        assert (
+            segment["byte_count"] == (base_dir / "A" / "part-00001.jl").stat().st_size
+        )
+        assert segment["success"] is True
+
+    @coroutine_test
+    async def test_evicted_partitions_continue_in_new_segments(self):
+        items = [
+            {"region": region, "n": n}
+            for n, region in enumerate(("A", "B", "C", "A", "B", "C"), start=1)
+        ]
+        base_dir = await self._run_exporter(
+            items,
+            {
+                "format": "jsonlines",
+                "partitions": {"field": "region", "max_active": 2},
+            },
+        )
+        for region, first, second in (("A", 1, 4), ("B", 2, 5), ("C", 3, 6)):
+            assert self._read_segment(base_dir / region / "part-00001.jl") == [
+                {"region": region, "n": first}
+            ]
+            assert self._read_segment(base_dir / region / "part-00002.jl") == [
+                {"region": region, "n": second}
+            ]
+        manifest = self._read_manifest(base_dir)
+        for region in ("A", "B", "C"):
+            partition = manifest["partitions"][region]
+            assert partition["item_count"] == 2
+            assert [segment["segment_id"] for segment in partition["segments"]] == [
+                1,
+                2,
+            ]
+            assert all(segment["success"] for segment in partition["segments"])
+            assert all(segment["item_count"] == 1 for segment in partition["segments"])
+
+    @coroutine_test
+    async def test_segment_files_are_never_overwritten(self):
+        base_dir = Path(self.temp_dir) / "out"
+        leftover = base_dir / "A" / "part-00001.jl"
+        leftover.parent.mkdir(parents=True)
+        leftover.write_bytes(b"sentinel\n")
+        await self._run_exporter(
+            [{"region": "A", "n": 1}],
+            {"format": "jsonlines", "partitions": {"field": "region"}},
+        )
+        assert leftover.read_bytes() == b"sentinel\n"
+        assert self._read_segment(base_dir / "A" / "part-00002.jl") == [
+            {"region": "A", "n": 1}
+        ]
+        manifest = self._read_manifest(base_dir)
+        (segment,) = manifest["partitions"]["A"]["segments"]
+        assert segment["segment_id"] == 2
+
+    @coroutine_test
+    async def test_quarantine_partition(self):
+        items = [
+            {"region": "A", "n": 1},
+            {"n": 2},  # missing partition field
+            {"region": "D", "n": 3},  # not in allowed
+        ]
+        base_dir = await self._run_exporter(
+            items,
+            {
+                "format": "jsonlines",
+                "partitions": {
+                    "field": "region",
+                    "allowed": ["A", "B"],
+                    "quarantine": "invalid",
+                },
+            },
+        )
+        assert self._read_segment(base_dir / "A" / "part-00001.jl") == [
+            {"region": "A", "n": 1}
+        ]
+        assert self._read_segment(base_dir / "invalid" / "part-00001.jl") == [
+            {"n": 2},
+            {"region": "D", "n": 3},
+        ]
+        manifest = self._read_manifest(base_dir)
+        assert set(manifest["partitions"]) == {"A", "invalid"}
+        assert manifest["partitions"]["invalid"]["item_count"] == 2
+
+    @coroutine_test
+    async def test_missing_value_without_quarantine_raises(self):
+        feed_exporter, spider, base_dir = self._make_exporter(
+            {"format": "jsonlines", "partitions": {"field": "region"}}
+        )
+        feed_exporter.item_scraped({"region": "A", "n": 1}, spider)
+        with pytest.raises(ValueError, match="no quarantine partition"):
+            feed_exporter.item_scraped({"n": 2}, spider)
+        await feed_exporter.close_spider(spider)
+        assert self._read_segment(base_dir / "A" / "part-00001.jl") == [
+            {"region": "A", "n": 1}
+        ]
+        manifest = self._read_manifest(base_dir)
+        assert set(manifest["partitions"]) == {"A"}
+
+    @coroutine_test
+    async def test_partition_values_are_encoded_as_path_segments(self):
+        items = [
+            {"region": "../escape", "n": 1},
+            {"region": "a/b", "n": 2},
+            {"region": "..", "n": 3},
+        ]
+        base_dir = await self._run_exporter(
+            items, {"format": "jsonlines", "partitions": {"field": "region"}}
+        )
+        assert self._read_segment(base_dir / "..%2Fescape" / "part-00001.jl") == [
+            {"region": "../escape", "n": 1}
+        ]
+        assert self._read_segment(base_dir / "a%2Fb" / "part-00001.jl") == [
+            {"region": "a/b", "n": 2}
+        ]
+        assert self._read_segment(base_dir / "%2E%2E" / "part-00001.jl") == [
+            {"region": "..", "n": 3}
+        ]
+        assert not (Path(self.temp_dir) / "escape").exists()
+        assert {path.name for path in base_dir.iterdir()} == {
+            "..%2Fescape",
+            "a%2Fb",
+            "%2E%2E",
+            "manifest.json",
+        }
+
+    @coroutine_test
+    async def test_item_filter_still_applies(self):
+        items = [
+            MyItem({"foo": "A"}),
+            {"foo": "B"},
+        ]
+        base_dir = await self._run_exporter(
+            items,
+            {
+                "format": "jsonlines",
+                "item_classes": ["tests.utils.feedexport.MyItem"],
+                "partitions": {"field": "foo"},
+            },
+        )
+        assert self._read_segment(base_dir / "A" / "part-00001.jl") == [{"foo": "A"}]
+        assert not (base_dir / "B").exists()
+
+    @coroutine_test
+    async def test_failed_segment_is_not_marked_complete(self):
+        feed_exporter, spider, base_dir = self._make_exporter(
+            {"format": "jsonlines", "partitions": {"field": "region"}},
+            {
+                "FEED_EXPORTERS": {
+                    "jsonlines": "tests.test_feedexport.ExceptionJsonLinesItemExporter",
+                },
+            },
+        )
+        with pytest.raises(RuntimeError, match="foo"):
+            feed_exporter.item_scraped({"region": "A", "n": 1}, spider)
+        await feed_exporter.close_spider(spider)
+        manifest = self._read_manifest(base_dir)
+        (segment,) = manifest["partitions"]["A"]["segments"]
+        assert segment["success"] is False
+        assert segment["item_count"] == 0
+
+    @coroutine_test
+    async def test_segment_failing_to_close_is_not_marked_complete(self):
+        base_dir = await self._run_exporter(
+            [{"region": "A", "n": 1}],
+            {
+                "format": "jsonlines",
+                "partitions": {"field": "region"},
+            },
+            {
+                "FEED_EXPORTERS": {
+                    "jsonlines": "tests.test_feedexport.ExceptionOnFinishJsonLinesItemExporter",
+                },
+            },
+        )
+        manifest = self._read_manifest(base_dir)
+        (segment,) = manifest["partitions"]["A"]["segments"]
+        assert segment["success"] is False
+        assert segment["item_count"] == 1
+
+    @pytest.mark.parametrize(
+        "feed_options",
+        [
+            {"format": "csv", "partitions": {"field": "region"}},
+            {"format": "jsonlines", "partitions": {}},
+            {"format": "jsonlines", "partitions": {"field": "region", "max_active": 0}},
+        ],
+    )
+    def test_unsupported_options(self, feed_options):
+        settings = {
+            "FEEDS": {
+                "out/": feed_options,
+            },
+        }
+        crawler = get_crawler(settings_dict=settings)
+        with pytest.raises(NotConfigured):
+            build_from_crawler(FeedExporter, crawler)
+
+    def test_batch_item_count_not_supported(self):
+        settings = {
+            "FEEDS": {
+                "out/%(batch_id)d/": {
+                    "format": "jsonlines",
+                    "batch_item_count": 10,
+                    "partitions": {"field": "region"},
+                },
+            },
+        }
+        crawler = get_crawler(settings_dict=settings)
+        with pytest.raises(NotConfigured):
+            build_from_crawler(FeedExporter, crawler)
+
+    def test_unsupported_storage_scheme(self):
+        settings = {
+            "FEEDS": {
+                "ftp://ftp.example.com/out/": {
+                    "format": "jsonlines",
+                    "partitions": {"field": "region"},
+                },
+            },
+        }
+        crawler = get_crawler(settings_dict=settings)
+        with pytest.raises(NotConfigured):
+            build_from_crawler(FeedExporter, crawler)
 
 
 class TestApplyUriParams:

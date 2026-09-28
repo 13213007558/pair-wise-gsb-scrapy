@@ -371,6 +371,68 @@ ItemFilter
    :members:
 
 
+.. _feed-partitions:
+
+Partitioned feeds
+=================
+
+.. versionadded:: VERSION
+
+A feed can partition its output into per-partition JSON Lines files based on
+the value of an item field, so that all items with the same field value are
+written into the same set of files. Partitioning is enabled through the
+``partitions`` :ref:`feed option <feed-options>` and is only supported for
+feeds using the local file system storage and the
+:ref:`JSON Lines <topics-feed-format-jsonlines>` format.
+
+The feed URI of a partitioned feed is a local directory. For every partition
+value, items are written into
+:file:`{feed URI}/{partition value}/part-{NNNNN}.jl`, where the partition
+value is percent-encoded so that it is always a single, safe path segment.
+
+For example:
+
+.. code-block:: python
+
+    FEEDS = {
+        "output/": {
+            "format": "jsonlines",
+            "partitions": {
+                "field": "region",
+                "max_active": 100,
+                "allowed": ["eu", "us"],
+                "quarantine": "invalid",
+            },
+        },
+    }
+
+The ``partitions`` feed option is a dictionary with the following keys:
+
+-   ``field`` (mandatory): name of the item field whose value defines the
+    partition of an item. Every item is exported into exactly one partition.
+
+-   ``max_active``: maximum number of partitions kept open for writing at
+    the same time. When a partition without an open file receives an item
+    and this limit has been reached, the least recently used open partition
+    is closed first, and the item is written into a new segment file of its
+    partition. Segment file names are never reused and existing files are
+    never overwritten. If undefined, all partitions are kept open.
+
+-   ``allowed``: list of allowed partition values. Items with a value that
+    is not in the list are treated as items with a missing value.
+
+-   ``quarantine``: partition value to use for items with a missing or
+    disallowed partition value. If undefined, such items raise an error.
+
+Items are written to each partition in the order they are scraped. No
+ordering is guaranteed across partitions.
+
+When the spider closes, a :file:`manifest.json` file is written into the
+feed URI directory. It lists every partition with its segment files, and
+for each segment its item count, byte count and whether it was written
+successfully. Segments whose writing failed are not marked as successful.
+
+
 .. _post-processing:
 
 Post-Processing
@@ -553,6 +615,9 @@ as a fallback value if that key is not provided for a specific feed definition:
 -   ``postprocessing``: list of :ref:`plugins <post-processing>` to use for post-processing.
 
     The plugins will be used in the order of the list passed.
+
+-   ``partitions``: :class:`dict` with :ref:`partitioning options
+    <feed-partitions>` to split the feed into per-partition files.
 
 .. setting:: FEED_EXPORT_ENCODING
 

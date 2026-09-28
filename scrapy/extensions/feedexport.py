@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
 import logging
 import re
 import sys
@@ -18,15 +19,17 @@ from datetime import datetime, timezone
 from pathlib import Path, PureWindowsPath
 from tempfile import NamedTemporaryFile
 from typing import IO, TYPE_CHECKING, Any, Protocol, TypeAlias, cast
-from urllib.parse import unquote, urlparse
+from urllib.parse import quote, unquote, urlparse
 from uuid import uuid4
 
+from itemadapter import ItemAdapter
 from twisted.internet.defer import Deferred, DeferredList
 from w3lib.url import file_uri_to_path
 from zope.interface import Interface
 
 from scrapy import Spider, signals
 from scrapy.exceptions import NotConfigured, ScrapyDeprecationWarning
+from scrapy.exporters import JsonLinesItemExporter
 from scrapy.extensions.postprocessing import PostProcessingManager
 from scrapy.utils._ftp import ftp_store_file
 from scrapy.utils.asyncio import is_asyncio_available, run_in_thread
@@ -406,6 +409,209 @@ class FTPFeedStorage(BlockingFeedStorage):
         )
 
 
+def _encode_partition_value(value: str) -> str:
+    """Return *value* encoded so that it is safe to use as a single path
+    segment: characters that are special in file systems or URLs are
+    percent-encoded, and the result is never "." or ".."."""
+    encoded = quote(value, safe="")
+    if encoded in (".", ".."):
+        encoded = encoded.replace(".", "%2E")
+    return encoded
+
+
+class _PartitionSegment:
+    """A single output file of a partition."""
+
+    def __init__(self, path: Path, segment_id: int) -> None:
+        self.path: Path = path
+        self.segment_id: int = segment_id
+        self.item_count: int = 0
+        self.byte_count: int = 0
+        self.success: bool = False
+
+
+class _Partition:
+    """All segments written for one partition value."""
+
+    def __init__(self, value: str) -> None:
+        self.value: str = value
+        self.encoded: str = _encode_partition_value(value)
+        self.next_segment_id: int = 1
+        self.segments: list[_PartitionSegment] = []
+        self.active_segment: _PartitionSegment | None = None
+        self.file: IO[bytes] | None = None
+        self.exporter: BaseItemExporter | None = None
+
+
+class _PartitionedFeedManager:
+    """Export items to per-partition JSON Lines files under a base directory.
+
+    The partition of an item is the value of a configured item field, so
+    every item goes into exactly one partition. At most *max_active*
+    partitions are kept open at the same time; when a partition without an
+    open segment receives an item, a new segment is started for it. Segment
+    files are created exclusively and their names are never reused, so
+    existing content is never overwritten.
+    """
+
+    def __init__(
+        self,
+        *,
+        uri: str,
+        feed_options: dict[str, Any],
+        spider: Spider,
+        exporters: dict[str, type[BaseItemExporter]],
+        crawler: Crawler,
+    ) -> None:
+        config = feed_options["partitions"]
+        self.uri: str = uri
+        self.feed_options: dict[str, Any] = feed_options
+        self.spider: Spider = spider
+        self.exporters: dict[str, type[BaseItemExporter]] = exporters
+        self.crawler: Crawler = crawler
+        self.field: str = config["field"]
+        self.max_active: int | None = config.get("max_active")
+        allowed = config.get("allowed")
+        self.allowed: set[str] | None = (
+            {str(value) for value in allowed} if allowed is not None else None
+        )
+        self.quarantine: str | None = config.get("quarantine")
+        self.base_dir: Path = Path(
+            file_uri_to_path(uri) if uri.startswith("file:") else uri
+        )
+        self.partitions: dict[str, _Partition] = {}
+        # Partition values with an open segment, least recently used first.
+        self._active: dict[str, _Partition] = {}
+
+    def export_item(self, item: Any) -> None:
+        value = self._partition_value(item)
+        partition = self.partitions.get(value)
+        if partition is None:
+            partition = self.partitions[value] = _Partition(value)
+        if value in self._active:
+            self._active[value] = self._active.pop(value)
+        else:
+            self._open_segment(partition)
+        partition = self._active[value]
+        assert partition.exporter is not None
+        assert partition.active_segment is not None
+        try:
+            partition.exporter.export_item(item)
+        except Exception:
+            self._close_segment(partition, success=False)
+            raise
+        partition.active_segment.item_count += 1
+
+    def close(self) -> None:
+        for value in list(self._active):
+            self._close_segment(self._active[value], success=True)
+        self._write_manifest()
+
+    def _partition_value(self, item: Any) -> str:
+        value = ItemAdapter(item).get(self.field)
+        if value is None or value == "":
+            return self._fallback(
+                f"item has no value for partition field {self.field!r}"
+            )
+        value = str(value)
+        if self.allowed is not None and value not in self.allowed:
+            return self._fallback(f"partition value {value!r} is not allowed")
+        return value
+
+    def _fallback(self, reason: str) -> str:
+        if self.quarantine is None:
+            raise ValueError(f"{reason} and no quarantine partition is configured")
+        return self.quarantine
+
+    def _open_segment(self, partition: _Partition) -> None:
+        if self.max_active is not None:
+            while len(self._active) >= self.max_active:
+                evicted = self._active.pop(next(iter(self._active)))
+                self._close_segment(evicted, success=True)
+        partition_dir = self.base_dir / partition.encoded
+        partition_dir.mkdir(parents=True, exist_ok=True)
+        while True:
+            segment_id = partition.next_segment_id
+            partition.next_segment_id += 1
+            path = partition_dir / f"part-{segment_id:05d}.jl"
+            try:
+                file = path.open("xb")
+            except FileExistsError:
+                continue  # left over from a previous run, never overwrite it
+            break
+        segment = _PartitionSegment(path, segment_id)
+        partition.segments.append(segment)
+        partition.active_segment = segment
+        partition.file = file
+        partition.exporter = build_from_crawler(
+            self.exporters[self.feed_options["format"]],
+            self.crawler,
+            file,
+            fields_to_export=self.feed_options["fields"],
+            encoding=self.feed_options["encoding"],
+            indent=self.feed_options["indent"],
+            **self.feed_options["item_export_kwargs"],
+        )
+        partition.exporter.start_exporting()
+        self._active[partition.value] = partition
+
+    def _close_segment(self, partition: _Partition, *, success: bool) -> None:
+        self._active.pop(partition.value, None)
+        segment = partition.active_segment
+        assert segment is not None
+        assert partition.exporter is not None
+        assert partition.file is not None
+        try:
+            partition.exporter.finish_exporting()
+            partition.file.flush()
+            segment.byte_count = partition.file.tell()
+        except Exception:
+            success = False
+            logger.exception(
+                f"Error closing partition segment {segment.path}",
+                extra={"spider": self.spider},
+            )
+        finally:
+            partition.file.close()
+        segment.success = success
+        partition.active_segment = None
+        partition.file = None
+        partition.exporter = None
+
+    def _write_manifest(self) -> None:
+        manifest = {
+            "feed": self.uri,
+            "spider": self.spider.name,
+            "partitions": {
+                value: {
+                    "item_count": sum(
+                        segment.item_count for segment in partition.segments
+                    ),
+                    "segments": [
+                        {
+                            "path": str(segment.path),
+                            "segment_id": segment.segment_id,
+                            "item_count": segment.item_count,
+                            "byte_count": segment.byte_count,
+                            "success": segment.success,
+                        }
+                        for segment in partition.segments
+                    ],
+                }
+                for value, partition in self.partitions.items()
+            },
+        }
+        self.base_dir.mkdir(parents=True, exist_ok=True)
+        path = self.base_dir / "manifest.json"
+        path.write_text(
+            json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+        )
+        logger.info(
+            f"Feed partition manifest for {self.uri} written to {path}",
+            extra={"spider": self.spider},
+        )
+
+
 class FeedSlot:
     def __init__(
         self,
@@ -499,6 +705,7 @@ class FeedExporter:
         self.feeds: dict[str, dict[str, Any]] = {}
         self.slots: list[FeedSlot] = []
         self.filters: dict[str, ItemFilter] = {}
+        self._partition_managers: dict[str, _PartitionedFeedManager] = {}
         self._pending_close_tasks: list[asyncio.Task[None] | Deferred[None]] = []
 
         if not self.settings["FEEDS"] and not self.settings["FEED_URI"]:
@@ -548,14 +755,26 @@ class FeedExporter:
                 raise NotConfigured
             if not self._exporter_supported(feed_options["format"]):
                 raise NotConfigured
+            if not self._partitions_supported(uri, feed_options):
+                raise NotConfigured
 
     def open_spider(self, spider: Spider) -> None:
         for uri, feed_options in self.feeds.items():
             uri_params = self._get_uri_params(spider, feed_options["uri_params"])
+            resolved_uri = apply_uri_params(uri, uri_params)
+            if "partitions" in feed_options:
+                self._partition_managers[uri] = _PartitionedFeedManager(
+                    uri=resolved_uri,
+                    feed_options=feed_options,
+                    spider=spider,
+                    exporters=self.exporters,
+                    crawler=self.crawler,
+                )
+                continue
             self.slots.append(
                 self._start_new_batch(
                     batch_id=1,
-                    uri=apply_uri_params(uri, uri_params),
+                    uri=resolved_uri,
                     feed_options=feed_options,
                     spider=spider,
                     uri_template=uri,
@@ -575,6 +794,9 @@ class FeedExporter:
                 await DeferredList(
                     cast("list[Deferred[None]]", list(self._pending_close_tasks))
                 )
+
+        for manager in self._partition_managers.values():
+            manager.close()
 
         # Send FEED_EXPORTER_CLOSED signal
         await self.crawler.signals.send_catch_log_async(signals.feed_exporter_closed)
@@ -675,6 +897,9 @@ class FeedExporter:
         )
 
     def item_scraped(self, item: Any, spider: Spider) -> None:
+        for uri, manager in self._partition_managers.items():
+            if self.filters[uri].accepts(item):
+                manager.export_item(item)
         slots = []
         for slot in self.slots:
             if not slot.filter.accepts(item):
@@ -730,6 +955,40 @@ class FeedExporter:
                 "feed URI; set it explicitly with the 'format' key"
             )
         return False
+
+    def _partitions_supported(self, uri: str, feed_options: dict[str, Any]) -> bool:
+        config = feed_options.get("partitions")
+        if config is None:
+            return True
+        scheme = urlparse(uri).scheme
+        if scheme not in ("", "file") and not PureWindowsPath(uri).drive:
+            logger.error(
+                f"Feed partitions are only supported for local file storage, "
+                f"not for storage scheme {scheme!r} ({uri})"
+            )
+            return False
+        format_ = feed_options["format"]
+        if format_ not in self.exporters or not issubclass(
+            self.exporters[format_], JsonLinesItemExporter
+        ):
+            logger.error(
+                f"Feed partitions are only supported for the JSON Lines "
+                f"format, not {format_!r} ({uri})"
+            )
+            return False
+        if feed_options["batch_item_count"]:
+            logger.error(
+                f"Feed partitions cannot be combined with batch_item_count ({uri})"
+            )
+            return False
+        if not config.get("field"):
+            logger.error(f"Feed partitions require a 'field' option ({uri})")
+            return False
+        max_active = config.get("max_active")
+        if max_active is not None and int(max_active) < 1:
+            logger.error(f"Feed partitions 'max_active' must be 1 or greater ({uri})")
+            return False
+        return True
 
     def _settings_are_valid(self) -> bool:
         """

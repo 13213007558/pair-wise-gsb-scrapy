@@ -135,6 +135,15 @@ one per actual value of the placeholder.
 
     Set by :class:`~scrapy.spidermiddlewares.depth.DepthMiddleware`.
 
+.. stat:: depth/request_reexpanded_count
+
+``depth/request_reexpanded_count``
+    Number of requests emitted again at a lower depth after the page that
+    produced them was discovered through a shorter path. Only set when
+    :setting:`DEPTH_SHORTEST_DISCOVERY` is enabled.
+
+    Set by :class:`~scrapy.spidermiddlewares.depth.DepthMiddleware`.
+
 .. stat:: downloader/exception_count
 
 ``downloader/exception_count``

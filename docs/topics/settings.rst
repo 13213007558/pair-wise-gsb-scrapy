@@ -731,6 +731,34 @@ also :ref:`faq-bfo-dfo`.
     other priority settings :setting:`REDIRECT_PRIORITY_ADJUST`
     and :setting:`RETRY_PRIORITY_ADJUST`.
 
+.. setting:: DEPTH_SHORTEST_DISCOVERY
+
+DEPTH_SHORTEST_DISCOVERY
+------------------------
+
+.. versionadded:: VERSION
+
+Default: ``False``
+
+Scope: ``scrapy.spidermiddlewares.depth.DepthMiddleware``
+
+Whether to track the shortest depth at which every request has been
+discovered, instead of only the depth of the first discovery.
+
+When enabled, the output requests of every downloaded response are recorded,
+and when a page that has already been downloaded is discovered again through
+a strictly shorter path, its recorded output requests are emitted again at
+depths computed from the shorter path. As a result, requests dropped for
+exceeding :setting:`DEPTH_LIMIT` because their target page was first
+discovered through a longer path get a new chance, and the crawl outcome no
+longer depends on which path to a page is downloaded first. The spider
+callback of a rediscovered page is not run again and no items are produced
+again; only the recorded output requests are emitted again.
+
+With :setting:`JOBDIR` set, the recorded depths and output requests are
+persisted into a :file:`requests.depths` file inside the job directory, so
+that resuming a crawl keeps using them.
+
 .. setting:: DEPTH_STATS_VERBOSE
 
 DEPTH_STATS_VERBOSE

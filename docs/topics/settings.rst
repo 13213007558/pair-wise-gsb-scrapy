@@ -731,6 +731,40 @@ also :ref:`faq-bfo-dfo`.
     other priority settings :setting:`REDIRECT_PRIORITY_ADJUST`
     and :setting:`RETRY_PRIORITY_ADJUST`.
 
+
+.. setting:: DEPTH_SHORTEST_PATH
+
+DEPTH_SHORTEST_PATH
+-------------------
+
+Default: ``False``
+
+Scope: ``scrapy.spidermiddlewares.depth.DepthMiddleware``
+
+Whether to crawl every page as if it had been reached through the shortest
+path found to it, regardless of the order in which pages are discovered.
+
+.. versionadded:: VERSION
+
+When enabled, the depth middleware records the shallowest depth at which
+every request is discovered and the output requests of every downloaded
+response. When a downloaded page is discovered again at a strictly lower
+depth, its recorded output requests are scheduled again at depths relative
+to the new depth, so links that were dropped for exceeding
+:setting:`DEPTH_LIMIT` through a longer path are still followed. The page
+itself is not downloaded again, and its callback does not run again.
+
+Only discoveries at a strictly lower depth trigger this re-scheduling, so
+cycles cannot cause infinite re-crawling on a finite website. Requests
+with :attr:`~scrapy.Request.dont_filter` set to ``True`` are not recorded.
+
+When :setting:`JOBDIR` is set, the recorded depths and output requests are
+stored in a file named :file:`requests.depths` in the job directory, so
+that they keep being used when the crawl is resumed.
+
+Enabling this setting increases memory usage, because the output requests
+of every downloaded response are kept in memory.
+
 .. setting:: DEPTH_STATS_VERBOSE
 
 DEPTH_STATS_VERBOSE

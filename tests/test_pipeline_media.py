@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import logging
 from typing import TYPE_CHECKING, Any, cast
 from unittest.mock import MagicMock
@@ -12,6 +13,7 @@ from scrapy import signals
 from scrapy.exceptions import ScrapyDeprecationWarning
 from scrapy.http import Request, Response
 from scrapy.pipelines.media import (
+    FileException,
     FileInfo,
     FileInfoOrError,
     MediaPipeline,
@@ -27,7 +29,7 @@ from tests.utils.decorators import coroutine_test
 from tests.utils.media_pipelines import mocked_download_func
 
 if TYPE_CHECKING:
-    from collections.abc import Awaitable
+    from collections.abc import Awaitable, Callable
 
     from twisted.internet.defer import Deferred
 
@@ -465,6 +467,338 @@ class TestAsyncMediaDownloaded(TestMediaPipeline):
             self.pipe._key_for_pipe("IMAGES", base_class_name="MediaPipeline")
             == "ASYNCMEDIADOWNLOADEDPIPELINE_IMAGES"
         )
+
+
+def _request_token(request: Request) -> str | None:
+    """Return the account token carried by the authorization data of a request."""
+    authorization = request.headers.get(b"Authorization")
+    if authorization is not None:
+        return authorization.decode()
+    cookies = request.cookies
+    value: Any = None
+    if isinstance(cookies, dict) and cookies:
+        value = next(iter(cookies.values()))
+    elif isinstance(cookies, list) and cookies:
+        value = cookies[0]["value"]
+    if value is not None:
+        return value.decode() if isinstance(value, bytes) else str(value)
+    cookiejar = request.meta.get("cookiejar")
+    if cookiejar is not None:
+        return str(cookiejar)
+    return None
+
+
+class FakeAuthorizedDownloader:
+    """Fake downloader that only serves requests with allowed tokens.
+
+    Downloads block on :attr:`gate` when *hold* is True, and :attr:`started`
+    is set once *started_after* downloads have started, so that tests can
+    observe in-flight downloads.
+    """
+
+    def __init__(
+        self,
+        allowed_tokens: set[str | None],
+        *,
+        started_after: int = 1,
+        hold: bool = False,
+    ):
+        self.allowed_tokens = allowed_tokens
+        self.started = asyncio.Event()
+        self.gate = asyncio.Event()
+        if not hold:
+            self.gate.set()
+        self._started_after = started_after
+        self.requests: list[Request] = []
+
+    @property
+    def tokens(self) -> list[str | None]:
+        """Tokens of the requests a download was started for."""
+        return [_request_token(request) for request in self.requests]
+
+    async def __call__(self, request: Request) -> Response:
+        self.requests.append(request)
+        if len(self.requests) >= self._started_after:
+            self.started.set()
+        await self.gate.wait()
+        token = _request_token(request)
+        if token not in self.allowed_tokens:
+            raise FileException(f"Access denied for {request.url}")
+        return Response(request.url, body=b"data")
+
+
+class AuthMediaPipeline(UserDefinedPipeline):
+    """Pipeline that tags each downloaded file with the token of its request."""
+
+    def __init__(self, *args: Any, crawler: Crawler, **kwargs: Any):
+        super().__init__(*args, crawler=crawler, **kwargs)
+        self.downloaded_tokens: list[str | None] = []
+
+    def get_media_requests(
+        self, item: Any, info: MediaPipeline.SpiderInfo
+    ) -> list[Request]:
+        return item.get("requests")  # type: ignore[no-any-return]
+
+    def media_downloaded(
+        self,
+        response: Response,
+        request: Request,
+        info: MediaPipeline.SpiderInfo,
+        *,
+        item: Any = None,
+    ) -> FileInfo:
+        token = _request_token(request)
+        self.downloaded_tokens.append(token)
+        return FileInfo(
+            url=request.url,
+            path=f"full/{token}",
+            checksum=None,
+            status="downloaded",
+        )
+
+    def item_completed(
+        self, results: list[FileInfoOrError], item: Any, info: MediaPipeline.SpiderInfo
+    ) -> Any:
+        item = super().item_completed(results, item, info)
+        item["results"] = results
+        return item
+
+
+auth_carrier = pytest.mark.parametrize(
+    "make_auth_request",
+    [
+        pytest.param(
+            lambda url, token: Request(url, headers={"Authorization": token}),
+            id="authorization-header",
+        ),
+        pytest.param(
+            lambda url, token: Request(url, cookies={"session": token}),
+            id="cookies",
+        ),
+        pytest.param(
+            lambda url, token: Request(url, cookies={b"session": token.encode()}),
+            id="cookies-bytes",
+        ),
+        pytest.param(
+            lambda url, token: Request(
+                url, cookies=[{"name": "session", "value": token}]
+            ),
+            id="cookies-list",
+        ),
+        pytest.param(
+            lambda url, token: Request(url, meta={"cookiejar": token}),
+            id="cookiejar",
+        ),
+    ],
+)
+
+
+class TestMediaPipelineAuth:
+    """Media downloads and cached results must stay within the account whose
+    credentials authorized them, while public files remain shareable."""
+
+    url = "https://media.example/attachment.pdf"
+
+    def _build_pipe(self, downloader: FakeAuthorizedDownloader) -> AuthMediaPipeline:
+        crawler = get_crawler(DefaultSpider)
+        crawler.spider = crawler._create_spider()
+        crawler.engine = MagicMock(download_async=downloader)
+        pipe = build_from_crawler(AuthMediaPipeline, crawler)
+        pipe.open_spider()
+        return pipe
+
+    def _waiting_count(self, pipe: AuthMediaPipeline) -> int:
+        return sum(len(w) for w in pipe.spiderinfo.waiting.values())
+
+    @auth_carrier
+    @coroutine_test
+    async def test_cache_hit_shared_within_account(
+        self, make_auth_request: Callable[[str, str], Request]
+    ):
+        downloader = FakeAuthorizedDownloader({"token-a"})
+        pipe = self._build_pipe(downloader)
+        item1 = await pipe.process_item(
+            {"requests": make_auth_request(self.url, "token-a")}
+        )
+        item2 = await pipe.process_item(
+            {"requests": make_auth_request(self.url, "token-a")}
+        )
+        expected = (
+            True,
+            FileInfo(
+                url=self.url, path="full/token-a", checksum=None, status="downloaded"
+            ),
+        )
+        assert pipe.downloaded_tokens == ["token-a"]
+        assert item1["results"] == [expected]
+        assert item2["results"] == [expected]
+
+    @auth_carrier
+    @coroutine_test
+    async def test_cached_result_not_shared_across_accounts(
+        self, make_auth_request: Callable[[str, str], Request]
+    ):
+        downloader = FakeAuthorizedDownloader({"token-a"})
+        pipe = self._build_pipe(downloader)
+        pipe.LOG_FAILED_RESULTS = False
+
+        item_a = await pipe.process_item(
+            {"requests": make_auth_request(self.url, "token-a")}
+        )
+        assert item_a["results"][0][0] is True
+
+        # A different account gets its own download, which is denied, instead
+        # of the file cached for the first account.
+        item_b = await pipe.process_item(
+            {"requests": make_auth_request(self.url, "token-b")}
+        )
+        assert downloader.tokens == ["token-a", "token-b"]
+        ok, failure = item_b["results"][0]
+        assert ok is False
+        assert isinstance(failure, Failure)
+        assert isinstance(failure.value, FileException)
+
+        # The cached failure of the second account does not affect the first.
+        item_a2 = await pipe.process_item(
+            {"requests": make_auth_request(self.url, "token-a")}
+        )
+        assert item_a2["results"][0][0] is True
+        assert item_a2["results"][0][1]["path"] == "full/token-a"
+
+        # The denied account keeps its cached failure without redownloading.
+        item_b2 = await pipe.process_item(
+            {"requests": make_auth_request(self.url, "token-b")}
+        )
+        assert item_b2["results"][0][0] is False
+        assert downloader.tokens == ["token-a", "token-b"]
+
+    @auth_carrier
+    @coroutine_test
+    async def test_cached_result_not_shared_with_public_request(
+        self, make_auth_request: Callable[[str, str], Request]
+    ):
+        downloader = FakeAuthorizedDownloader({"token-a"})
+        pipe = self._build_pipe(downloader)
+        pipe.LOG_FAILED_RESULTS = False
+
+        item_a = await pipe.process_item(
+            {"requests": make_auth_request(self.url, "token-a")}
+        )
+        assert item_a["results"][0][0] is True
+
+        # A request without credentials gets its own, denied download instead
+        # of the file cached for the authorized account.
+        item_public = await pipe.process_item({"requests": Request(self.url)})
+        assert downloader.tokens == ["token-a", None]
+        assert item_public["results"][0][0] is False
+
+    @auth_carrier
+    @coroutine_test
+    async def test_private_request_does_not_reuse_public_result(
+        self, make_auth_request: Callable[[str, str], Request]
+    ):
+        downloader = FakeAuthorizedDownloader({None, "token-a"})
+        pipe = self._build_pipe(downloader)
+
+        item_public = await pipe.process_item({"requests": Request(self.url)})
+        assert item_public["results"][0][0] is True
+
+        item_a = await pipe.process_item(
+            {"requests": make_auth_request(self.url, "token-a")}
+        )
+        assert downloader.tokens == [None, "token-a"]
+        assert item_a["results"][0][1]["path"] == "full/token-a"
+
+    @coroutine_test
+    async def test_public_requests_share_results(self):
+        downloader = FakeAuthorizedDownloader({None})
+        pipe = self._build_pipe(downloader)
+        item1 = await pipe.process_item({"requests": Request(self.url)})
+        item2 = await pipe.process_item({"requests": Request(self.url)})
+        assert pipe.downloaded_tokens == [None]
+        assert item1["results"] == item2["results"]
+
+    @auth_carrier
+    @coroutine_test
+    async def test_parallel_requests_same_account_merge(
+        self, make_auth_request: Callable[[str, str], Request]
+    ):
+        downloader = FakeAuthorizedDownloader({"token-a"}, hold=True)
+        pipe = self._build_pipe(downloader)
+        task1 = asyncio.create_task(
+            pipe.process_item({"requests": make_auth_request(self.url, "token-a")})
+        )
+        await downloader.started.wait()
+        task2 = asyncio.create_task(
+            pipe.process_item({"requests": make_auth_request(self.url, "token-a")})
+        )
+        while self._waiting_count(pipe) < 2:
+            await asyncio.sleep(0)
+        downloader.gate.set()
+        item1, item2 = await asyncio.gather(task1, task2)
+        assert pipe.downloaded_tokens == ["token-a"]
+        assert item1["results"][0][1]["path"] == "full/token-a"
+        assert item2["results"][0][1]["path"] == "full/token-a"
+
+    @auth_carrier
+    @coroutine_test
+    async def test_parallel_requests_other_accounts_not_merged(
+        self, make_auth_request: Callable[[str, str], Request]
+    ):
+        downloader = FakeAuthorizedDownloader(
+            {"token-a", "token-b"}, started_after=2, hold=True
+        )
+        pipe = self._build_pipe(downloader)
+        task1 = asyncio.create_task(
+            pipe.process_item({"requests": make_auth_request(self.url, "token-a")})
+        )
+        task2 = asyncio.create_task(
+            pipe.process_item({"requests": make_auth_request(self.url, "token-b")})
+        )
+        try:
+            # Both accounts must start their own download instead of the
+            # second one waiting on the download of the first one.
+            await asyncio.wait_for(downloader.started.wait(), timeout=1)
+        finally:
+            downloader.gate.set()
+        item1, item2 = await asyncio.gather(task1, task2)
+        assert sorted(pipe.downloaded_tokens, key=str) == ["token-a", "token-b"]
+        assert item1["results"][0][1]["path"] == "full/token-a"
+        assert item2["results"][0][1]["path"] == "full/token-b"
+
+    @auth_carrier
+    @coroutine_test
+    async def test_waiter_cancellation(
+        self, make_auth_request: Callable[[str, str], Request]
+    ):
+        downloader = FakeAuthorizedDownloader({"token-a"}, hold=True)
+        pipe = self._build_pipe(downloader)
+        task1 = asyncio.create_task(
+            pipe.process_item({"requests": make_auth_request(self.url, "token-a")})
+        )
+        await downloader.started.wait()
+        task2 = asyncio.create_task(
+            pipe.process_item({"requests": make_auth_request(self.url, "token-a")})
+        )
+        while self._waiting_count(pipe) < 2:
+            await asyncio.sleep(0)
+        task2.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task2
+        # The cancelled waiter is dropped, the download continues for the
+        # remaining one.
+        assert self._waiting_count(pipe) == 1
+        downloader.gate.set()
+        item1 = await task1
+        assert item1["results"][0][1]["path"] == "full/token-a"
+
+        # The completed download is cached and shared with later requests of
+        # the same account.
+        item3 = await pipe.process_item(
+            {"requests": make_auth_request(self.url, "token-a")}
+        )
+        assert item3["results"][0][1]["path"] == "full/token-a"
+        assert pipe.downloaded_tokens == ["token-a"]
 
 
 class TestMediaPipelineAllowRedirectSettings:

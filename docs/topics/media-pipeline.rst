@@ -29,6 +29,14 @@ being scheduled for download, and connect those responses that arrive containing
 the same media to that queue. This avoids downloading the same media more than
 once when it's shared by several items.
 
+This sharing only happens between requests authorized the same way: requests
+that differ in their ``Authorization``, ``Proxy-Authorization`` or ``Cookie``
+headers, in their :ref:`cookies <cookies>` or in the ``cookiejar``
+:ref:`request meta <topics-request-meta>` key never share a download or a
+cached result, so that a file downloaded for one account cannot be served to
+another. Requests without such authorization data share downloads and cached
+results as usual.
+
 Using the Files Pipeline
 ========================
 

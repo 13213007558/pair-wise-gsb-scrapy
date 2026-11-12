@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import asyncio
 import functools
+import hashlib
+import json
 import logging
 import warnings
 from abc import ABC, abstractmethod
@@ -69,6 +71,11 @@ class _MediaRequestFiltered(FileException):
 
 def _media_request_filtered(failure: Failure) -> bool:
     return isinstance(failure.value, _MediaRequestFiltered)
+
+
+# Headers whose values authorize a request, and so identify the account the
+# response belongs to.
+_AUTH_HEADERS = (b"authorization", b"cookie", b"proxy-authorization")
 
 
 class MediaPipeline(ABC):
@@ -171,10 +178,43 @@ class MediaPipeline(ABC):
                 )
         return await ensure_awaitable(self.item_completed(results, item, info))
 
+    def _cache_key(self, request: Request) -> bytes:
+        """Return the key used to merge and cache the result of *request*.
+
+        It is the request fingerprint for requests without authorization
+        data, so that public files are downloaded only once. For requests
+        with authorization data (credentials in headers, cookies or a
+        cookie jar) it also covers that data, so that a result is only
+        shared with requests authorized the same way.
+        """
+        fp = self._fingerprinter.fingerprint(request)
+        auth_data: dict[str, Any] = {}
+        for header in _AUTH_HEADERS:
+            values = request.headers.getlist(header)
+            if values:
+                auth_data[header.decode()] = [value.hex() for value in values]
+        cookies = request.cookies
+        if cookies:
+            # Cookie names can be bytes, which JSON object keys do not
+            # support. Cookie values are stringified by json.dumps().
+            if isinstance(cookies, dict):
+                auth_data["cookies"] = {str(name): v for name, v in cookies.items()}
+            else:
+                auth_data["cookies"] = [
+                    {str(name): v for name, v in cookie.items()} for cookie in cookies
+                ]
+        cookiejar = request.meta.get("cookiejar")
+        if cookiejar is not None:
+            auth_data["cookiejar"] = cookiejar
+        if not auth_data:
+            return fp
+        auth_json = json.dumps(auth_data, sort_keys=True, default=str)
+        return hashlib.sha1(fp + auth_json.encode()).digest()  # noqa: S324
+
     async def _process_request(
         self, request: Request, info: SpiderInfo, item: Any
     ) -> FileInfo:
-        fp = self._fingerprinter.fingerprint(request)
+        fp = self._cache_key(request)
 
         eb: Callable[[Failure], FileInfo] | None = request.errback
         request.callback = NO_CALLBACK
@@ -192,10 +232,13 @@ class MediaPipeline(ABC):
             return cached_result
 
         # Otherwise, wait for result
-        wad: Deferred[FileInfo] = Deferred()
+        waiting = info.waiting[fp]
+        # If the waiter is cancelled, drop its deferred so that completing
+        # the download does not try to fire it again.
+        wad: Deferred[FileInfo] = Deferred(waiting.remove)
         if eb:
             wad.addErrback(eb)
-        info.waiting[fp].append(wad)
+        waiting.append(wad)
 
         # Check if request is downloading right now to avoid doing it twice
         if fp in info.downloading:

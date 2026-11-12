@@ -347,3 +347,138 @@ Local data directories
 Scrapy loads the contents of the :setting:`JOBDIR` and :setting:`HTTPCACHE_DIR`
 directories with :mod:`pickle`, which can run arbitrary code, so protect them
 from write access by untrusted parties as you would your project source code.
+
+.. _security-untrusted-settings:
+
+Untrusted configuration
+=======================
+
+Settings are not data. Many settings name an import path that Scrapy imports,
+or name a class, callable or module that Scrapy instantiates or calls.
+Accepting such settings from a user who may not run code in the Crawler
+process is therefore equivalent to accepting code from that user.
+
+Where settings are imported
+---------------------------
+
+The import and the side effects happen at different moments. Storing an import
+path in :class:`~scrapy.settings.Settings` does not import anything, but the
+following paths do, without a crawl having to start:
+
+* :meth:`~scrapy.settings.BaseSettings.setmodule` imports the module named
+  after the setting value.
+* :meth:`~scrapy.settings.BaseSettings.get_component_priority_dict_with_base`
+  imports every component named in a :ref:`component priority dictionary
+  <component-priority-dictionaries>`. The middleware, extension, pipeline,
+  contract and download-handler managers all call it while they are built,
+  which happens when a crawler starts.
+* :class:`~scrapy.spiderloader.SpiderLoader` walks every module named in
+  :setting:`SPIDER_MODULES`, and :setting:`COMMANDS_MODULE` does the same for
+  commands.
+* :setting:`ADDONS`, :setting:`DEFAULT_ITEM_CLASS`,
+  :setting:`DOWNLOADER_CLIENTCONTEXTFACTORY`, :setting:`HTTPCACHE_DBM_MODULE`,
+  :setting:`HTTPCACHE_POLICY`, :setting:`HTTPCACHE_STORAGE`,
+  :setting:`ITEM_PROCESSOR`, :setting:`LOG_FORMATTER`,
+  :setting:`LOG_ROOT_FORMATTER`, :setting:`REQUEST_FINGERPRINTER_CLASS`,
+  :setting:`RETRY_EXCEPTIONS`, the ``*_CLASS`` and ``*_QUEUE`` scheduler
+  settings, :setting:`SPIDER_LOADER_CLASS`, :setting:`STATS_CLASS`,
+  :setting:`TWISTED_DNS_RESOLVER`, :setting:`TWISTED_REACTOR`, and the
+  per-feed import keys accepted by feed exports (``item_classes``,
+  ``item_filter``, ``item_processor``, and ``uri_params``) name code as
+  well.
+
+The value can also carry a class or a callable instead of a string; that is
+equally executable and equally hard to validate as data.
+
+Beyond code, some settings reach the local process environment:
+
+* :setting:`DOWNLOAD_HANDLERS` and :setting:`DOWNLOAD_HANDLERS_BY_NAME` choose
+  the implementation used for a URL scheme, and the default ``file://``
+  handler reads any path the process can read.
+* :setting:`FEEDS`, :setting:`FEED_URI`, :setting:`FEED_STORAGES`,
+  :setting:`JOBDIR`, :setting:`LOG_FILE`, and the media pipelines write
+  files or objects chosen by the configuration.
+* :setting:`TELNETCONSOLE_ENABLED` and :setting:`REMOTE_CONTROL_ENABLED` open
+  local ports that expose a Python shell or message-based control of the
+  process.
+* the ``AWS_*``, ``FTP_*``, ``GCS_*``, ``HTTPAUTH_*``, ``MAIL_*``, and ``S3_*``
+  settings carry credentials, and feed and media storage settings cause
+  outbound traffic with them.
+
+What validation can and cannot guarantee
+----------------------------------------
+
+Validation can guarantee that a configuration document is a JSON object, that
+every key is on an allowlist, that every value has the expected JSON type, and
+that keys chosen for code, credentials, files or listeners are rejected. It
+can also prevent a rejected value from being resolved or imported, because
+the check runs before any component dictionary is normalized. The entry point
+also locks the settings it controls at a priority above the standard ones, so
+a spider or a ``-s`` option cannot reopen those surfaces during the crawl.
+
+Validation does not isolate code. Once the server enables a component, that
+component runs in the Crawler process with the process's filesystem,
+environment, sockets and credentials. A class-name allowlist is not a
+sandbox: an allowlisted component that later receives untrusted input can
+still be unsafe, and any setting that the server itself lets a user influence
+can undo the guarantees above on its own. Isolation requires a separate
+process, container or user boundary around the whole crawl, not a longer list
+of strings.
+
+Minimal restricted entry point
+------------------------------
+
+:func:`scrapy.settings.restricted.apply_restricted_settings` accepts a JSON
+object of data-only values and applies them on top of settings that the
+server controls. It rejects everything that is not on its allowlist, rejects
+the settings above that name code, files, credentials or listeners, and locks
+the code-loading and listener settings at a priority that no standard or finite
+priority can override, so that neither a spider nor a command-line option can
+turn them back on.
+
+.. code-block:: python
+
+    import json
+
+    from scrapy.crawler import CrawlerProcess
+    from scrapy.settings.restricted import apply_restricted_settings
+    from myproject.spiders import ReportSpider
+
+    with open("uploaded.json", encoding="utf-8") as upload_file:
+        upload = json.load(upload_file)
+
+    process = CrawlerProcess()
+    process.settings = apply_restricted_settings(
+        upload,
+        settings=process.settings,
+    )
+    process.crawl(ReportSpider)
+    process.start()
+
+The entry point can also read a :file:`.json` file directly, with
+:func:`~scrapy.settings.restricted.apply_restricted_settings_file`.
+
+Settings that the server already defined at :data:`SERVER_PRIORITY` (the
+``project`` level) or above keep their values. An upload can only change
+settings that are still at a lower priority, which is why passing the server
+settings as *settings* matters.
+
+What the server must still do
+-----------------------------
+
+The restrictions above describe the values this entry point accepts, not the
+behaviour of the components that the server enables. A server that accepts
+uploads should still:
+
+* keep its own settings at a priority the upload cannot override, either at
+  :data:`SERVER_PRIORITY` or above, or in a layer it re-applies after the
+  upload, and never pass an uploaded import path into
+  :meth:`~scrapy.settings.BaseSettings.setmodule` or any other import path
+  that it resolves itself;
+* disable :setting:`TELNETCONSOLE_ENABLED`,
+  :setting:`REMOTE_CONTROL_ENABLED`, and the unused ``file`` and ``data``
+  download schemes;
+* give each crawl a process, container or OS user that cannot read the server
+  configuration, the feed or job directories, or the credentials of another
+  crawl. The allowlist above is defensive input validation; it is not an
+  operating-system boundary.

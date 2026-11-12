@@ -166,6 +166,9 @@ Settings API
 .. autoclass:: BaseSettings
    :members:
 
+.. automodule:: scrapy.settings.restricted
+   :members: apply_restricted_settings, apply_restricted_settings_file
+
 .. _topics-api-spiderloader:
 
 SpiderLoader API

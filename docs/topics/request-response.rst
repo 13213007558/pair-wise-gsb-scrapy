@@ -808,6 +808,7 @@ Those are:
 * :reqmeta:`autothrottle_dont_adjust_delay`
 * :reqmeta:`bindaddress`
 * :reqmeta:`body_file`
+* :reqmeta:`cache_provenance`
 * :reqmeta:`cache_timestamp`
 * :reqmeta:`cookiejar`
 * :reqmeta:`delay`

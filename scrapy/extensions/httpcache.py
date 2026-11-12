@@ -3,12 +3,13 @@ from __future__ import annotations
 import gzip
 import logging
 import pickle
+from dataclasses import dataclass
 from datetime import UTC
 from email.utils import parsedate_to_datetime
 from importlib import import_module
 from pathlib import Path
 from time import time
-from typing import IO, TYPE_CHECKING, Any, Concatenate, cast
+from typing import IO, TYPE_CHECKING, Any, Concatenate, Final, Literal, cast
 from urllib.parse import quote
 from weakref import WeakKeyDictionary
 
@@ -32,6 +33,50 @@ if TYPE_CHECKING:
 
 
 logger = logging.getLogger(__name__)
+
+# Values of :attr:`CacheProvenance.source`, also used as response flags so the
+# origin of a cached response can be audited from ``response.flags`` without
+# importing the dataclass. A response fetched directly during the current
+# authenticated request carries neither of these flags.
+CACHE_FRESH: Final = "cache-fresh"
+CACHE_STALE: Final = "cache-stale"
+CACHE_REVALIDATED: Final = "cache-revalidated"
+CACHE_OFFLINE: Final = "cache-offline"
+
+CacheSource = Literal[
+    "cache-fresh", "cache-stale", "cache-revalidated", "cache-offline"
+]
+
+
+@dataclass(frozen=True, slots=True)
+class CacheProvenance:
+    """Authorization provenance and freshness of a cached response.
+
+    Attached to ``request.meta`` under :reqmeta:`cache_provenance` whenever the
+    HTTP cache middleware serves a stored response instead of downloading one.
+    Callbacks that require real-time authorization must reject every response
+    whose *origin_verified_at* is older than the authentication they need:
+    freshness only says the entry was still usable, not that the origin checked
+    the request again.
+
+    *stored_at* is the Unix time the entry was last written to the cache. It
+    changes every time the entry is written, including a recovery that reused
+    a stored body without contacting the origin, so it must never be treated
+    as an authentication time. *origin_verified_at* is the Unix time of the
+    last response the origin actually produced for the request; it moves
+    forward only on a first-hand download or a successful revalidation.
+
+    .. versionadded:: VERSION
+    """
+
+    source: CacheSource
+    stored_at: float
+    origin_verified_at: float
+
+    @property
+    def revalidated_with_origin(self) -> bool:
+        """Whether the origin answered the current request itself."""
+        return self.source == CACHE_REVALIDATED
 
 
 def _get_scope(settings: BaseSettings, supported: tuple[str, ...]) -> str:
@@ -287,20 +332,30 @@ class DbmCacheStorage:
         result = self._read_data(spider, request)
         if result is None:
             return None  # not cached
-        data, ts = result
+        data, ts, verified_ts = result
         request.meta["cache_timestamp"] = ts
+        # Entries written before origin verification was tracked only know
+        # their storage time. Treating it as the verification time keeps the
+        # provenance conservative rather than pretending no proof exists.
+        request.meta["cache_origin_verified_timestamp"] = verified_ts
         return response_from_dict(data)
 
     def store_response(
         self, spider: Spider, request: Request, response: Response
     ) -> None:
         key = self._fingerprinter.fingerprint(request).hex()
+        now = time()
+        # First-hand responses and entries replaced with a fresh response carry
+        # the verification time explicitly. A 304 revalidation re-stores the
+        # cached entry without overwriting it, keeping its original value.
+        verified_ts = request.meta.get("cache_origin_verified_timestamp", now)
         self.db[f"{key}_data"] = pickle.dumps(response.to_dict(), protocol=4)
-        self.db[f"{key}_time"] = str(time())
+        self.db[f"{key}_time"] = str(now)
+        self.db[f"{key}_verified_time"] = str(verified_ts)
 
     def _read_data(
         self, spider: Spider, request: Request
-    ) -> tuple[dict[str, Any], float] | None:
+    ) -> tuple[dict[str, Any], float, float] | None:
         key = self._fingerprinter.fingerprint(request).hex()
         db = self.db
         tkey = f"{key}_time"
@@ -312,7 +367,9 @@ class DbmCacheStorage:
             return None  # expired
 
         data = cast("dict[str, Any]", pickle.loads(db[f"{key}_data"]))  # noqa: S301
-        return data, ts
+        vkey = f"{key}_verified_time"
+        verified_ts = float(db[vkey]) if vkey in db else ts
+        return data, ts, verified_ts
 
 
 class FilesystemCacheStorage:
@@ -361,6 +418,12 @@ class FilesystemCacheStorage:
             with self._open(datapath, "rb") as f:
                 data.update(pickle.load(f))  # noqa: S301
         request.meta["cache_timestamp"] = metadata["timestamp"]
+        # Entries written before origin verification was tracked only know
+        # their storage time. Treating it as the verification time keeps the
+        # provenance conservative rather than pretending no proof exists.
+        request.meta["cache_origin_verified_timestamp"] = metadata.get(
+            "origin_verified_timestamp", metadata["timestamp"]
+        )
         return response_from_dict(data)
 
     def store_response(
@@ -370,12 +433,18 @@ class FilesystemCacheStorage:
         rpath = Path(self._get_request_path(spider, request))
         if not rpath.exists():
             rpath.mkdir(parents=True)
+        now = time()
+        # First-hand responses and entries replaced with a fresh response carry
+        # the verification time explicitly. A 304 revalidation re-stores the
+        # cached entry without overwriting it, keeping its original value.
+        verified_ts = request.meta.get("cache_origin_verified_timestamp", now)
         metadata = {
             "url": request.url,
             "method": request.method,
             "status": response.status,
             "response_url": response.url,
-            "timestamp": time(),
+            "timestamp": now,
+            "origin_verified_timestamp": verified_ts,
         }
         with self._open(rpath / "meta", "wb") as f:
             f.write(repr(metadata).encode())

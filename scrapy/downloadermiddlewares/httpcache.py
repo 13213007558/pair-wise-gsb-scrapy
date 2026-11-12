@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 from email.utils import formatdate
+from time import time
 from typing import TYPE_CHECKING, Self, cast
 from weakref import finalize
 
@@ -15,6 +16,14 @@ from scrapy.exceptions import (
     DownloadTimeoutError,
     IgnoreRequest,
     NotConfigured,
+)
+from scrapy.extensions.httpcache import (
+    CACHE_FRESH,
+    CACHE_OFFLINE,
+    CACHE_REVALIDATED,
+    CACHE_STALE,
+    CacheProvenance,
+    CacheSource,
 )
 from scrapy.utils.decorators import _warn_spider_arg
 from scrapy.utils.defer import maybe_deferred_to_future
@@ -104,6 +113,7 @@ class HttpCacheMiddleware:
         cachedresponse.flags.append("cached")
         if self.policy.is_cached_response_fresh(cachedresponse, request):
             self.stats.inc_value("httpcache/hit")
+            self._attach_provenance(cachedresponse, request, CACHE_FRESH)
             return cachedresponse
 
         # Keep a reference to cached response to avoid a second cache lookup on
@@ -112,6 +122,28 @@ class HttpCacheMiddleware:
         self._mark_downloading(request)
 
         return None
+
+    def _attach_provenance(
+        self, response: Response, request: Request, source: CacheSource
+    ) -> None:
+        """Record where *response* comes from and how fresh its authorization
+        proof is, so callbacks can tell history stored in the cache apart from
+        answers the origin gave to the current authenticated request."""
+        stored_at = request.meta.get("cache_timestamp")
+        verified_at = request.meta.get(
+            "cache_origin_verified_timestamp", stored_at
+        )
+        if stored_at is None or verified_at is None:
+            # Custom storage backends are only required to set
+            # cache_timestamp; fall back to the current time rather than emit
+            # an unusable provenance record.
+            stored_at = verified_at = time()
+        response.flags.append(source)
+        request.meta["cache_provenance"] = CacheProvenance(
+            source=source,
+            stored_at=float(stored_at),
+            origin_verified_at=float(verified_at),
+        )
 
     def _retrieve(self, request: Request) -> Response | None:
         try:
@@ -210,11 +242,25 @@ class HttpCacheMiddleware:
             self.stats.inc_value("httpcache/revalidate")
             if response.status == 304:
                 self._freshen_cached_response(cachedresponse, response)
+                # The origin answered the conditional request itself, so this
+                # is a fresh authorization check. Both the storage time and the
+                # verification time move to now even though the entry keeps the
+                # old body.
+                now = time()
+                request.meta["cache_timestamp"] = now
+                request.meta["cache_origin_verified_timestamp"] = now
                 self._cache_response(cachedresponse, request)
+                self._attach_provenance(cachedresponse, request, CACHE_REVALIDATED)
+            else:
+                # A stale entry kept without an origin answer (e.g. a 5xx
+                # response) only has its historical authorization proof.
+                self._attach_provenance(cachedresponse, request, CACHE_STALE)
             return cachedresponse
 
         self.stats.inc_value("httpcache/invalidate")
         request.meta.pop("cache_timestamp", None)
+        request.meta.pop("cache_origin_verified_timestamp", None)
+        request.meta.pop("cache_provenance", None)
         self._cache_response(response, request)
         return response
 
@@ -228,6 +274,9 @@ class HttpCacheMiddleware:
             exception, self.DOWNLOAD_EXCEPTIONS
         ):
             self.stats.inc_value("httpcache/errorrecovery")
+            # The origin could not be reached, so nothing re-ran the
+            # authorization: the entry is served on its historical proof only.
+            self._attach_provenance(cachedresponse, request, CACHE_OFFLINE)
             return cachedresponse
         return None
 

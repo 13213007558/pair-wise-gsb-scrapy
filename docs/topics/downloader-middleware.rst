@@ -420,7 +420,71 @@ HttpCacheMiddleware
     response was stored, useful e.g. to interpret dates relative to the time
     the page was downloaded rather than to the current time.
 
+    .. reqmeta:: cache_provenance
+
+    .. versionadded:: VERSION
+
+    When a response comes from the cache, its
+    :attr:`~scrapy.http.Response.meta` also exposes the
+    :reqmeta:`cache_provenance` key, a
+    :class:`~scrapy.extensions.httpcache.CacheProvenance` object describing
+    where the response comes from and how fresh its authorization proof is.
+    Its ``source`` is one of:
+
+        * ``"cache-fresh"``: a still-fresh entry served without contacting
+          the origin;
+        * ``"cache-stale"``: a stale entry kept because the origin did not
+          provide a replacement, e.g. after a server error;
+        * ``"cache-revalidated"``: a stale entry the origin revalidated for
+          the current request with a ``304 Not Modified`` answer;
+        * ``"cache-offline"``: a stale entry served because the origin could
+          not be reached at all.
+
+    The same value is also appended to :attr:`~scrapy.http.Response.flags`,
+    so the origin of a response can be audited without reading its meta.
+
+    ``origin_verified_at`` is the Unix time of the last response the origin
+    actually produced for the request. It moves forward only on a first-hand
+    download or a successful revalidation, while ``stored_at`` (the storage
+    time, also available as :reqmeta:`cache_timestamp`) changes every time
+    the entry is written, including a revalidation that does not re-run the
+    origin's authorization logic. Callbacks that require real-time
+    authorization must therefore reject cached responses whose
+    ``origin_verified_at`` is too old, and must not use ``stored_at`` as an
+    authentication time. A response downloaded directly during the current
+    request has no :reqmeta:`cache_provenance` key.
+
 .. module:: scrapy.extensions.httpcache
+
+.. class:: CacheProvenance
+
+    .. versionadded:: VERSION
+
+    Authorization provenance and freshness of a response served by the HTTP
+    cache, available as :reqmeta:`cache_provenance`. A response downloaded
+    directly carries no such object.
+
+    .. attribute:: source
+
+        One of ``"cache-fresh"``, ``"cache-stale"``,
+        ``"cache-revalidated"`` or ``"cache-offline"``. The same string is
+        appended to :attr:`~scrapy.http.Response.flags`.
+
+    .. attribute:: stored_at
+
+        Unix timestamp of when the cache entry was last written. This is not
+        an authorization time.
+
+    .. attribute:: origin_verified_at
+
+        Unix timestamp of the last response the origin actually produced for
+        the request. It advances only on a first-hand download or a successful
+        revalidation.
+
+    .. method:: revalidated_with_origin()
+
+        Return ``True`` when the origin answered the current request, i.e.
+        when *source* is ``"cache-revalidated"``.
 
 .. _httpcache-policy-dummy:
 
@@ -581,7 +645,11 @@ class, including those of third-party plugins, are cached and restored intact.
 
       On a cache hit, set ``request.meta["cache_timestamp"]`` (see
       :reqmeta:`cache_timestamp`) to the Unix timestamp of when the response
-      was stored.
+      was stored, and ``request.meta["cache_origin_verified_timestamp"]`` to
+      the Unix timestamp of the last response the origin produced for the
+      request (see :reqmeta:`cache_provenance`). The latter is preserved
+      across revalidations that do not re-run the origin's authorization
+      logic. Entries that predate it may fall back to the storage time.
 
     .. method:: store_response(spider, request, response)
 

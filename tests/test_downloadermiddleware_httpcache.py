@@ -19,7 +19,15 @@ from scrapy import signals
 from scrapy.core.downloader.middleware import DownloaderMiddlewareManager
 from scrapy.downloadermiddlewares.httpcache import HttpCacheMiddleware
 from scrapy.exceptions import IgnoreRequest
-from scrapy.extensions.httpcache import DummyPolicy, rfc1123_to_epoch
+from scrapy.extensions.httpcache import (
+    CACHE_FRESH,
+    CACHE_OFFLINE,
+    CACHE_REVALIDATED,
+    CACHE_STALE,
+    CacheProvenance,
+    DummyPolicy,
+    rfc1123_to_epoch,
+)
 from scrapy.http import BodyFileResponse, HtmlResponse, Request, Response
 from scrapy.spiders import Spider
 from scrapy.utils.asyncio import sleep
@@ -48,6 +56,41 @@ class AlwaysStalePolicy(DummyPolicy):
 
     def is_cached_response_fresh(self, cachedresponse, request):
         return False
+
+
+class TimestampOnlyStorage:
+    """Storage backend that only honors the ``cache_timestamp`` contract, as
+    third-party backends written before provenance was introduced do."""
+
+    def __init__(self, settings):
+        from scrapy.extensions.httpcache import FilesystemCacheStorage
+
+        self._wrapped = FilesystemCacheStorage(settings)
+
+    def open_spider(self, spider):
+        self._wrapped.open_spider(spider)
+
+    def close_spider(self, spider):
+        self._wrapped.close_spider(spider)
+
+    def store_response(self, spider, request, response):
+        self._wrapped.store_response(spider, request, response)
+
+    def retrieve_response(self, spider, request):
+        response = self._wrapped.retrieve_response(spider, request)
+        if response is not None:
+            request.meta.pop("cache_origin_verified_timestamp", None)
+        return response
+
+
+class NoTimestampStorage(TimestampOnlyStorage):
+    """Storage backend that sets neither timestamp on a cache hit."""
+
+    def retrieve_response(self, spider, request):
+        response = super().retrieve_response(spider, request)
+        if response is not None:
+            request.meta.pop("cache_timestamp", None)
+        return response
 
 
 class TestBase:
@@ -258,6 +301,49 @@ class StorageTestMixin(TestBase):
             assert isinstance(cached_response, HtmlResponse)
             self.assertEqualResponse(self.response, cached_response)
 
+    def test_storage_tracks_origin_verification_time(self):
+        with self._storage() as (storage, crawler):
+            storage.store_response(crawler.spider, self.request, self.response)
+            request = self.request.copy()
+            assert storage.retrieve_response(crawler.spider, request) is not None
+            stored_at = request.meta["cache_timestamp"]
+            verified_at = request.meta["cache_origin_verified_timestamp"]
+            assert stored_at == verified_at
+
+            # A 304 revalidation re-stores the entry: the storage time moves
+            # forward but the authorization time must stay untouched.
+            later = stored_at + 100
+            request.meta["cache_timestamp"] = later
+            request.meta["cache_origin_verified_timestamp"] = verified_at
+            with mock.patch(
+                "scrapy.extensions.httpcache.time", return_value=later
+            ):
+                storage.store_response(crawler.spider, request, self.response)
+            reread = self.request.copy()
+            assert storage.retrieve_response(crawler.spider, reread) is not None
+            assert reread.meta["cache_timestamp"] == later
+            assert (
+                reread.meta["cache_origin_verified_timestamp"] == verified_at
+            )
+
+    def test_storage_legacy_entry_falls_back_to_storage_time(self):
+        with self._storage() as (storage, crawler):
+            storage.store_response(crawler.spider, self.request, self.response)
+            self._drop_verification_metadata(storage, crawler.spider, self.request)
+            request = self.request.copy()
+            assert storage.retrieve_response(crawler.spider, request) is not None
+            assert (
+                request.meta["cache_origin_verified_timestamp"]
+                == request.meta["cache_timestamp"]
+            )
+
+    def _drop_verification_metadata(
+        self, storage: Any, spider: Spider, request: Request
+    ) -> None:
+        """Remove the origin-verification metadata to emulate a cache entry
+        written by a Scrapy release that did not track it."""
+        raise NotImplementedError
+
 
 class PolicyTestMixin(TestBase):
     """Mixin containing policy-specific test methods."""
@@ -295,6 +381,173 @@ class PolicyTestMixin(TestBase):
                     mw.storage.retrieve_response(mw.crawler.spider, self.request),
                     self.response.__class__,
                 )
+
+
+class CacheProvenanceTestMixin(TestBase):
+    """Authorization provenance and freshness attached to cached responses."""
+
+    policy_class = "scrapy.extensions.httpcache.RFC2616Policy"
+
+    def _cacheable_response(
+        self, body: bytes = b"protected", **headers: Any
+    ) -> Response:
+        headers.setdefault("Date", self.today)
+        headers.setdefault("Cache-Control", "max-age=1000")
+        headers.setdefault("Last-Modified", self.yesterday)
+        return Response(self.request.url, headers=headers, body=body)
+
+    def _stored_verification_time(self, mw: HttpCacheMiddleware) -> float:
+        # First-hand responses are stamped by the storage when written, so read
+        # the entry back instead of inspecting the request meta.
+        request = Request(self.request.url)
+        assert mw.storage.retrieve_response(mw.crawler.spider, request) is not None
+        return request.meta["cache_origin_verified_timestamp"]
+
+    @coroutine_test
+    async def test_firsthand_response_has_no_provenance(self):
+        with self._middleware() as mw:
+            assert await mw.process_request(self.request) is None
+            response = mw.process_response(self.request, self._cacheable_response())
+            assert "cached" not in response.flags
+            assert "cache_provenance" not in self.request.meta
+
+    @coroutine_test
+    async def test_fresh_hit_provenance(self):
+        with self._middleware() as mw:
+            mw.process_response(self.request, self._cacheable_response())
+
+            request = Request(self.request.url)
+            response = await mw.process_request(request)
+            assert isinstance(response, Response)
+            provenance = request.meta["cache_provenance"]
+            assert isinstance(provenance, CacheProvenance)
+            assert provenance.source == CACHE_FRESH
+            assert CACHE_FRESH in response.flags
+            assert provenance.stored_at == provenance.origin_verified_at
+            assert not provenance.revalidated_with_origin
+
+    @coroutine_test
+    async def test_304_revalidation_updates_authorization_time(self):
+        with self._middleware() as mw:
+            mw.process_response(self.request, self._cacheable_response())
+            original_verified_at = self._stored_verification_time(mw)
+
+            # Force revalidation regardless of the freshness lifetime.
+            request = Request(
+                self.request.url, headers={"Cache-Control": "max-age=0"}
+            )
+            assert await mw.process_request(request) is None
+            revalidate = Response(
+                self.request.url, status=304, headers={"Date": self.tomorrow}
+            )
+            response = mw.process_response(request, revalidate)
+            provenance = request.meta["cache_provenance"]
+
+            assert provenance.source == CACHE_REVALIDATED
+            assert CACHE_REVALIDATED in response.flags
+            assert provenance.revalidated_with_origin
+            assert provenance.origin_verified_at > original_verified_at
+
+            # The refreshed entry keeps the new authorization time on its next
+            # fresh hit, instead of falling back to the storage time.
+            follow_up = Request(self.request.url)
+            cached = await mw.process_request(follow_up)
+            assert isinstance(cached, Response)
+            assert follow_up.meta["cache_provenance"].source == CACHE_FRESH
+            assert (
+                follow_up.meta["cache_provenance"].origin_verified_at
+                == provenance.origin_verified_at
+            )
+
+    @coroutine_test
+    async def test_stale_5xx_keeps_historical_authorization(self):
+        with self._middleware() as mw:
+            mw.process_response(self.request, self._cacheable_response())
+            verified_at = self._stored_verification_time(mw)
+
+            request = Request(
+                self.request.url, headers={"Cache-Control": "max-age=0"}
+            )
+            assert await mw.process_request(request) is None
+            response = mw.process_response(
+                request, Response(self.request.url, status=503)
+            )
+            provenance = request.meta["cache_provenance"]
+
+            assert provenance.source == CACHE_STALE
+            assert CACHE_STALE in response.flags
+            assert provenance.origin_verified_at == verified_at
+            assert not provenance.revalidated_with_origin
+
+    @coroutine_test
+    async def test_offline_fallback_provenance(self):
+        from twisted.internet.error import ConnectionLost
+
+        with self._middleware() as mw:
+            mw.process_response(self.request, self._cacheable_response())
+            verified_at = self._stored_verification_time(mw)
+
+            request = Request(
+                self.request.url, headers={"Cache-Control": "max-age=0"}
+            )
+            assert await mw.process_request(request) is None
+            response = mw.process_exception(request, ConnectionLost("offline"))
+            assert isinstance(response, Response)
+            provenance = request.meta["cache_provenance"]
+
+            assert provenance.source == CACHE_OFFLINE
+            assert CACHE_OFFLINE in response.flags
+            assert provenance.origin_verified_at == verified_at
+            assert not provenance.revalidated_with_origin
+
+    @coroutine_test
+    async def test_invalidation_clears_provenance(self):
+        with self._middleware() as mw:
+            mw.process_response(self.request, self._cacheable_response())
+
+            request = Request(
+                self.request.url, headers={"Cache-Control": "max-age=0"}
+            )
+            assert await mw.process_request(request) is None
+            assert "cache_provenance" not in request.meta
+            response = mw.process_response(
+                request,
+                self._cacheable_response(body=b"new"),
+            )
+            assert "cache_provenance" not in request.meta
+            assert "cache_timestamp" not in request.meta
+            assert "cache_origin_verified_timestamp" not in request.meta
+            assert "cached" not in response.flags
+
+    @coroutine_test
+    async def test_provenance_with_timestamp_only_storage(self):
+        # A custom backend that only sets cache_timestamp must still produce a
+        # usable provenance record instead of failing or leaving gaps.
+        with self._middleware(HTTPCACHE_STORAGE=TimestampOnlyStorage) as mw:
+            mw.process_response(self.request, self._cacheable_response())
+            request = Request(self.request.url)
+            response = await mw.process_request(request)
+            assert isinstance(response, Response)
+            provenance = request.meta["cache_provenance"]
+            assert provenance.source == CACHE_FRESH
+            assert isinstance(provenance.stored_at, float)
+            assert provenance.origin_verified_at == provenance.stored_at
+
+    @coroutine_test
+    async def test_provenance_without_any_storage_timestamp(self):
+        # A backend that sets neither timestamp gets a provenance record built
+        # from the current time rather than an unusable empty one.
+        with self._middleware(HTTPCACHE_STORAGE=NoTimestampStorage) as mw:
+            mw.process_response(self.request, self._cacheable_response())
+            before = time.time()
+            request = Request(self.request.url)
+            response = await mw.process_request(request)
+            after = time.time()
+            assert isinstance(response, Response)
+            provenance = request.meta["cache_provenance"]
+            assert provenance.source == CACHE_FRESH
+            assert before <= provenance.stored_at <= after
+            assert provenance.origin_verified_at == provenance.stored_at
 
 
 class DummyPolicyTestMixin(PolicyTestMixin):
@@ -866,6 +1119,17 @@ class FilesystemStorageTestMixin(StorageTestMixin):
         rpath = Path(storage._get_request_path(spider, request))
         (rpath / "response_data").unlink()
 
+    def _drop_verification_metadata(self, storage, spider, request) -> None:
+        import pickle
+
+        rpath = Path(storage._get_request_path(spider, request))
+        metapath = rpath / "pickled_meta"
+        with storage._open(metapath, "rb") as f:
+            metadata = pickle.load(f)
+        metadata.pop("origin_verified_timestamp", None)
+        with storage._open(metapath, "wb") as f:
+            pickle.dump(metadata, f)
+
     @pytest.mark.parametrize("filename", ["request_headers", "response_headers"])
     def test_storage_header_file(self, filename: str) -> None:
         headers = [
@@ -903,6 +1167,10 @@ class DbmStorageTestMixin(StorageTestMixin):
         }
         storage.db[f"{key}_data"] = pickle.dumps(data, protocol=4)
 
+    def _drop_verification_metadata(self, storage, spider, request) -> None:
+        key = storage._fingerprinter.fingerprint(request).hex()
+        del storage.db[f"{key}_verified_time"]
+
 
 class TestFilesystemStorageWithDummyPolicy(
     FilesystemStorageTestMixin, DummyPolicyTestMixin
@@ -911,7 +1179,7 @@ class TestFilesystemStorageWithDummyPolicy(
 
 
 class TestFilesystemStorageWithRFC2616Policy(
-    FilesystemStorageTestMixin, RFC2616PolicyTestMixin
+    FilesystemStorageTestMixin, CacheProvenanceTestMixin, RFC2616PolicyTestMixin
 ):
     policy_class = "scrapy.extensions.httpcache.RFC2616Policy"
 
@@ -920,7 +1188,9 @@ class TestDbmStorageWithDummyPolicy(DbmStorageTestMixin, DummyPolicyTestMixin):
     policy_class = "scrapy.extensions.httpcache.DummyPolicy"
 
 
-class TestDbmStorageWithRFC2616Policy(DbmStorageTestMixin, RFC2616PolicyTestMixin):
+class TestDbmStorageWithRFC2616Policy(
+    DbmStorageTestMixin, CacheProvenanceTestMixin, RFC2616PolicyTestMixin
+):
     policy_class = "scrapy.extensions.httpcache.RFC2616Policy"
 
 

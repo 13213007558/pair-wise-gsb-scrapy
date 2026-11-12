@@ -13,11 +13,21 @@ import re
 import sys
 import warnings
 from abc import ABC, abstractmethod
+from collections import defaultdict
 from collections.abc import Callable, Iterable, Iterator
 from datetime import UTC, datetime
 from pathlib import Path, PureWindowsPath
 from tempfile import NamedTemporaryFile
-from typing import IO, TYPE_CHECKING, Any, Protocol, Self, TypeAlias, cast
+from typing import (
+    IO,
+    TYPE_CHECKING,
+    Any,
+    Protocol,
+    Self,
+    TypeAlias,
+    cast,
+    runtime_checkable,
+)
 from urllib.parse import unquote, urlparse
 from uuid import uuid4
 
@@ -193,6 +203,37 @@ class FeedStorageProtocol(Protocol):
 
         .. versionchanged:: 2.20.0
            This method may now be a coroutine function (``async def``).
+        """
+
+
+@runtime_checkable
+class StagedFeedStorageProtocol(Protocol):
+    """Protocol that feed storages may additionally follow to support the
+    ``staged_commit`` :ref:`feed option <feed-options>`.
+
+    .. versionadded:: VERSION
+
+    With staged commit, :meth:`~FeedStorageProtocol.store` must upload the
+    file to a private staging area where readers of the feed cannot reach it,
+    and the methods below decide the fate of that staged output once the
+    outcome of the whole feed is known.
+    """
+
+    def commit(self) -> Coroutine[Any, Any, None] | Deferred[None] | None:
+        """Publish the staged output, e.g. by atomically updating a readable
+        index that points to it.
+
+        Called once per stored file, only after every file of the feed has
+        been stored successfully. Must be idempotent: if the staged output is
+        already published (e.g. after a crash and recovery), it must not be
+        published again.
+        """
+
+    def abort(self) -> Coroutine[Any, Any, None] | Deferred[None] | None:
+        """Discard the staged output without publishing it.
+
+        Called once per stored file when some file of the feed could not be
+        stored, so that no partial output of the feed ever becomes visible.
         """
 
 
@@ -685,6 +726,14 @@ class FeedExporter:
         self.filters: dict[str, ItemFilter] = {}
         self.processors: dict[str, _ItemProcessor | None] = {}
         self._pending_close_tasks: list[asyncio.Task[None] | Deferred[None]] = []
+        # Storages of staged feeds (staged_commit feed option), grouped by
+        # feed URI template, kept so that their staged output can be published
+        # or discarded once the outcome of the whole feed is known.
+        self._staged_storages: dict[str, list[StagedFeedStorageProtocol]] = (
+            defaultdict(list)
+        )
+        self._staged_failed: set[str] = set()
+        self._staged_finalized: set[str] = set()
         # Item export may await user-defined code (e.g. an async def
         # export_item() method), while item_scraped signals are sent
         # concurrently (see the CONCURRENT_ITEMS setting). This lock prevents
@@ -829,6 +878,7 @@ class FeedExporter:
         """Report that the target of *slot* already exists, and mark *slot* so
         that nothing is written to it."""
         slot._skipped = True
+        self._staged_failed.add(slot.uri_template)
         logger.error(
             f"Not writing {slot.uri} because it already exists and the feed "
             "mode is 'create'; its items are lost. To write it instead, remove "
@@ -855,8 +905,40 @@ class FeedExporter:
                     cast("list[Deferred[None]]", list(self._pending_close_tasks))
                 )
 
+        await self._finalize_staged_feeds(spider)
+
         # Send FEED_EXPORTER_CLOSED signal
         await self.crawler.signals.send_catch_log_async(signals.feed_exporter_closed)
+
+    async def _finalize_staged_feeds(self, spider: Spider) -> None:
+        """Publish the staged output of every staged feed whose files were all
+        stored, and discard it otherwise."""
+        for uri_template, storages in self._staged_storages.items():
+            if uri_template in self._staged_finalized:
+                continue
+            self._staged_finalized.add(uri_template)
+            failed = uri_template in self._staged_failed
+            errors = False
+            for storage in storages:
+                try:
+                    if failed:
+                        await ensure_awaitable(storage.abort())
+                    else:
+                        await ensure_awaitable(storage.commit())
+                except Exception:
+                    errors = True
+                    logger.exception(
+                        "Error %s the staged output of feed %s",
+                        "discarding" if failed else "publishing",
+                        uri_template,
+                        extra={"spider": spider},
+                    )
+            if not failed and not errors:
+                logger.info(
+                    "Published the staged output of feed %s",
+                    uri_template,
+                    extra={"spider": spider},
+                )
 
     def _schedule_slot_close(
         self, slot: FeedSlot, spider: Spider
@@ -914,6 +996,7 @@ class FeedExporter:
             self._skip(slot)
             self.crawler.stats.inc_value(f"feedexport/failed_count/{slot_type}")
         except Exception:
+            self._staged_failed.add(slot.uri_template)
             logger.exception(
                 "Error storing %s",
                 logmsg,
@@ -921,6 +1004,9 @@ class FeedExporter:
             )
             self.crawler.stats.inc_value(f"feedexport/failed_count/{slot_type}")
         else:
+            if slot.feed_options.get("staged_commit"):
+                assert isinstance(slot.storage, StagedFeedStorageProtocol)
+                self._staged_storages[slot.uri_template].append(slot.storage)
             logger.info("Stored %s", logmsg, extra={"spider": spider})
             self.crawler.stats.inc_value(f"feedexport/success_count/{slot_type}")
 
@@ -1065,14 +1151,25 @@ class FeedExporter:
             try:
                 storage = self._get_storage(uri, feed_options)
                 self._check_storage_mode(uri, storage, feed_options)
-                return True
             except NotConfigured as e:
                 logger.error(
                     "Disabled feed storage scheme: %(scheme)s. Reason: %(reason)s",
                     {"scheme": scheme, "reason": str(e)},
                 )
-        else:
-            logger.error("Unknown feed storage scheme: %(scheme)s", {"scheme": scheme})
+                return False
+            if feed_options.get("staged_commit") and not isinstance(
+                storage, StagedFeedStorageProtocol
+            ):
+                logger.error(
+                    f"{type(storage).__name__} does not support staged commit, "
+                    f"which the staged_commit feed option of the {uri} feed "
+                    f"requires. Use a storage that follows "
+                    f"StagedFeedStorageProtocol or remove the staged_commit "
+                    f"feed option."
+                )
+                return False
+            return True
+        logger.error("Unknown feed storage scheme: %(scheme)s", {"scheme": scheme})
         return False
 
     @staticmethod

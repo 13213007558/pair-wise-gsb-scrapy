@@ -339,6 +339,52 @@ soon as a file reaches the maximum item count, that file is delivered to the
 feed URI, allowing item delivery to start way before the end of the crawl.
 
 
+.. _staged-commit:
+
+Staged commit
+-------------
+
+.. versionadded:: VERSION
+
+Feeds whose output must not become visible to readers until all of it has
+been written and validated can use the ``staged_commit`` :ref:`feed option
+<feed-options>`:
+
+.. code-block:: python
+
+    FEEDS = {
+        "s3://bucket/private-feed.jsonl": {
+            "format": "jsonlines",
+            "staged_commit": True,
+        }
+    }
+
+With staged commit, storing a feed file (including every batch file, see
+:setting:`FEED_EXPORT_BATCH_ITEM_COUNT`) only uploads it to a private staging
+area that readers of the feed cannot reach. Once every file of the feed has
+been stored, Scrapy calls the ``commit()`` method of each of those storages,
+which must publish the staged output, e.g. by atomically updating a readable
+index that points to it. If any file of the feed fails to be stored, Scrapy
+instead calls the ``abort()`` method of each of those storages, which must
+discard the staged output, so that no partial output of the feed ever
+becomes visible.
+
+If a feed stores no file at all (e.g. it is empty and the ``store_empty``
+:ref:`feed option <feed-options>` is ``False``), nothing is committed and
+nothing becomes visible.
+
+Only storage backends that follow
+:class:`~scrapy.extensions.feedexport.StagedFeedStorageProtocol` support
+staged commit. The built-in storage backends do not: their ``store()``
+publishes the feed directly, and they cannot take already-published output
+back. Setting ``staged_commit`` on a feed whose storage backend does not
+support it prevents the crawl from running, instead of silently degrading to
+direct publishing. To use staged commit with one of the built-in storage
+backends, wrap it in a :ref:`custom storage backend
+<topics-feed-storage-custom>` that stages files into a private location and
+publishes them on ``commit()``.
+
+
 .. _topics-feed-storage-custom:
 
 Custom storage backends
@@ -378,6 +424,14 @@ separate thread once the crawl is done, keeping the reactor free.
 
 .. autoclass:: scrapy.extensions.feedexport.BlockingFeedStorage
    :members: _store_in_thread
+
+To support the ``staged_commit`` :ref:`feed option <feed-options>`, a storage
+backend must additionally follow
+:class:`~scrapy.extensions.feedexport.StagedFeedStorageProtocol`, see
+:ref:`staged commit <staged-commit>`.
+
+.. autoclass:: scrapy.extensions.feedexport.StagedFeedStorageProtocol
+   :members:
 
 A storage backend receives a file. To send items to a service as they are
 scraped, write an :ref:`item pipeline <topics-item-pipeline>` instead.
@@ -619,6 +673,12 @@ as a fallback value if that key is not provided for a specific feed definition:
 -   ``mode``: falls back to :setting:`FEED_MODE`.
 
     .. versionadded:: 2.20.0
+
+-   ``staged_commit``: if ``True``, feed files are stored in a private
+    staging area and only published once every file of the feed has been
+    stored, see :ref:`staged commit <staged-commit>`.
+
+    .. versionadded:: VERSION
 
 -   ``store_empty``: falls back to :setting:`FEED_STORE_EMPTY`.
 

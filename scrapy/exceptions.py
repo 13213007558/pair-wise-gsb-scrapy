@@ -55,6 +55,19 @@ class DontCloseSpider(Exception):
     from being closed."""
 
 
+class FormSubmissionRejected(Exception):
+    """Raised to reject the submission of a form request that no longer
+    matches the :class:`~scrapy.http.FormSubmissionIntent` set by the code
+    that created it.
+
+    The exception message explains the mismatch without including any field
+    values, so it is safe to log or show to the caller. In a request errback,
+    the reason is available as ``str(failure.value)``.
+
+    .. versionadded:: VERSION
+    """
+
+
 class CloseSpider(Exception):
     """Raised from a :ref:`spider callback <topics-spiders>`, a
     :ref:`downloader middleware <topics-downloader-middleware>`, or while the

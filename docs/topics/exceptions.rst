@@ -18,6 +18,8 @@ the :ref:`download handler exceptions <download-handlers-exceptions>`.
 
 .. autoexception:: DropItem
 
+.. autoexception:: FormSubmissionRejected
+
 .. autoexception:: IgnoreRequest
 
 .. autoexception:: NotConfigured

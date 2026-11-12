@@ -2,18 +2,16 @@ from __future__ import annotations
 
 import re
 import warnings
-from typing import TYPE_CHECKING, Any
+from typing import Any
 from urllib.parse import parse_qs, unquote_to_bytes
 
 import pytest
 
-from scrapy.exceptions import ScrapyDeprecationWarning
-from scrapy.http import FormRequest, HtmlResponse
+from scrapy import Request
+from scrapy.exceptions import FormSubmissionRejected, ScrapyDeprecationWarning
+from scrapy.http import FormRequest, FormSubmissionIntent, HtmlResponse
 from scrapy.utils.httpobj import urlparse_cached
 from tests.utils.bases.http_request import TestRequestBase
-
-if TYPE_CHECKING:
-    from scrapy import Request
 
 
 def _buildresponse(body: bytes | str, **kwargs: Any) -> HtmlResponse:
@@ -1068,3 +1066,417 @@ class TestFormRequest(TestRequestBase):
 
         with pytest.raises(ValueError, match="No <form> element found with"):
             FormRequest.from_response(response, formxpath='//div[@id="outside-form"]/p')
+
+
+def _intent(**kwargs: Any) -> FormSubmissionIntent:
+    values: dict[str, Any] = {
+        "targets": ["http://example.com/login"],
+        "methods": ["POST"],
+        "field_categories": {"credentials": ["username", "password"]},
+    }
+    values.update(kwargs)
+    return FormSubmissionIntent(**values)
+
+
+@pytest.mark.filterwarnings("ignore::scrapy.exceptions.ScrapyDeprecationWarning")
+class TestFormSubmissionIntent:
+    def test_multiple_forms_relative_action(self):
+        response = _buildresponse(
+            """<form name="search" action="/search" method="GET">
+            <input name="q" value="scrapy">
+            </form>
+            <form name="login" action="auth/login" method="POST">
+            <input name="username" value="">
+            <input name="password" value="">
+            <input type="submit" name="submit" value="Login">
+            </form>""",
+            url="http://example.com/account/",
+        )
+        intent = _intent(
+            targets=["http://example.com/account/auth/login"],
+            field_categories={
+                "credentials": ["username", "password"],
+                "submission": ["submit"],
+            },
+        )
+        request = FormRequest.from_response(
+            response,
+            formname="login",
+            formdata={"username": "john", "password": "secret"},
+            submission_intent=intent,
+        )
+
+        assert request.url == "http://example.com/account/auth/login"
+        assert request.method == "POST"
+        fs = _qs(request)
+        assert fs == {
+            b"username": [b"john"],
+            b"password": [b"secret"],
+            b"submit": [b"Login"],
+        }
+        assert request.submission_intent is intent
+
+    def test_relative_action_target_must_be_absolute(self):
+        response = _buildresponse(
+            """<form name="login" action="auth/login" method="POST">
+            <input name="username" value="">
+            </form>""",
+            url="http://example.com/account/",
+        )
+        with pytest.raises(ValueError, match="not an absolute URL"):
+            FormRequest.from_response(
+                response,
+                formname="login",
+                submission_intent=_intent(targets=["auth/login"]),
+            )
+
+    def test_unapproved_target_rejected_at_parse_time(self):
+        response = _buildresponse(
+            """<form name="login" action="http://evil.example/collect" method="POST">
+            <input name="username" value="">
+            <input name="password" value="">
+            </form>"""
+        )
+        with pytest.raises(FormSubmissionRejected, match="target"):
+            FormRequest.from_response(
+                response,
+                formname="login",
+                formdata={"username": "john", "password": "hunter2"},
+                submission_intent=_intent(),
+            )
+
+    def test_unapproved_method_rejected_at_parse_time(self):
+        response = _buildresponse(
+            """<form action="/login" method="GET">
+            <input name="username" value="">
+            <input name="password" value="">
+            </form>"""
+        )
+        with pytest.raises(FormSubmissionRejected, match="method"):
+            FormRequest.from_response(
+                response,
+                formdata={"username": "john", "password": "hunter2"},
+                submission_intent=_intent(targets=["http://example.com/login"]),
+            )
+
+    def test_unapproved_field_rejected_at_parse_time(self):
+        response = _buildresponse(
+            """<form action="/login" method="POST">
+            <input name="username" value="">
+            <input name="password" value="">
+            <input name="remember" value="yes">
+            </form>"""
+        )
+        with pytest.raises(FormSubmissionRejected, match="'remember'"):
+            FormRequest.from_response(
+                response,
+                formdata={"username": "john", "password": "hunter2"},
+                submission_intent=_intent(targets=["http://example.com/login"]),
+            )
+
+    def test_new_formdata_field_rejected(self):
+        response = _buildresponse(
+            """<form action="/login" method="POST">
+            <input name="username" value="">
+            <input name="password" value="">
+            </form>"""
+        )
+        with pytest.raises(FormSubmissionRejected, match="'injected'"):
+            FormRequest.from_response(
+                response,
+                formdata={"username": "john", "password": "hunter2", "injected": "x"},
+                submission_intent=_intent(targets=["http://example.com/login"]),
+            )
+
+    def test_rejection_message_does_not_contain_field_values(self):
+        response = _buildresponse(
+            """<form action="/login" method="POST">
+            <input name="username" value="">
+            <input name="password" value="">
+            <input name="secret_note" value="">
+            </form>"""
+        )
+        values = ["john", "hunter2", "top-secret-value"]
+        with pytest.raises(FormSubmissionRejected) as excinfo:
+            FormRequest.from_response(
+                response,
+                formdata={
+                    "username": values[0],
+                    "password": values[1],
+                    "secret_note": values[2],
+                },
+                submission_intent=_intent(targets=["http://example.com/login"]),
+            )
+        message = str(excinfo.value)
+        assert "secret_note" in message
+        for value in values:
+            assert value not in message
+
+    def test_duplicate_fields(self):
+        response = _buildresponse(
+            """<form action="/login" method="POST">
+            <input name="username" value="">
+            <input name="role" value="user">
+            </form>"""
+        )
+        request = FormRequest.from_response(
+            response,
+            formdata=(("username", "john"), ("role", "user"), ("role", "admin")),
+            submission_intent=_intent(
+                targets=["http://example.com/login"],
+                field_categories={"credentials": ["username", "role"]},
+            ),
+        )
+        assert _qs(request)[b"role"] == [b"user", b"admin"]
+        assert _qs(request)[b"username"] == [b"john"]
+
+    def test_duplicate_field_name_only_needs_one_approval(self):
+        response = _buildresponse(
+            """<form action="/login" method="POST">
+            <input name="username" value="">
+            </form>"""
+        )
+        request = FormRequest.from_response(
+            response,
+            formdata=(("username", "john"), ("username", "johnny")),
+            submission_intent=_intent(targets=["http://example.com/login"]),
+        )
+        assert _qs(request)[b"username"] == [b"john", b"johnny"]
+
+    def test_get_duplicate_fields(self):
+        response = _buildresponse(
+            """<form action="/login" method="GET">
+            <input name="username" value="">
+            </form>"""
+        )
+        request = FormRequest.from_response(
+            response,
+            formdata=(("username", "a"), ("username", "b")),
+            submission_intent=_intent(
+                targets=["http://example.com/login"], methods=["GET"]
+            ),
+        )
+        assert urlparse_cached(request).query == "username=a&username=b"
+
+    def test_plain_form_request_without_intent_is_unchanged(self):
+        request = FormRequest(
+            "http://example.com/anywhere",
+            formdata={"anything": "goes"},
+            method="POST",
+        )
+        assert request.submission_intent is None
+        assert request.body == b"anything=goes"
+
+    def test_copy_and_replace_revalidate(self):
+        request = FormRequest(
+            "http://example.com/login",
+            formdata={"username": "john", "password": "secret"},
+            submission_intent=_intent(),
+        )
+        assert request.copy().submission_intent is request.submission_intent
+
+        with pytest.raises(FormSubmissionRejected, match="method"):
+            request.replace(method="GET")
+
+        with pytest.raises(FormSubmissionRejected, match="target"):
+            request.replace(url="http://evil.example/login")
+
+        with pytest.raises(FormSubmissionRejected, match="'extra'"):
+            request.replace(
+                body=b"username=john&password=secret&extra=1",
+            )
+
+    def test_replace_defaults_are_approved(self):
+        request = FormRequest(
+            "http://example.com/login",
+            formdata={"username": "john", "password": "secret"},
+            submission_intent=_intent(),
+        )
+        replacement = request.replace(headers={"X-Test": "1"})
+        assert replacement.url == request.url
+        assert replacement.body == request.body
+        assert replacement.method == request.method
+
+    def test_redirect_method_change_is_rejected(self):
+        from scrapy.downloadermiddlewares.redirect import RedirectMiddleware
+        from scrapy.http import Response
+        from scrapy.utils.misc import build_from_crawler
+        from scrapy.utils.spider import DefaultSpider
+        from scrapy.utils.test import get_crawler
+
+        crawler = get_crawler(DefaultSpider)
+        crawler.spider = crawler._create_spider()
+        middleware = build_from_crawler(RedirectMiddleware, crawler)
+        request = FormRequest(
+            "http://example.com/login",
+            formdata={"username": "john", "password": "secret"},
+            submission_intent=_intent(),
+        )
+
+        response = Response(request.url, status=302, headers={"Location": "/login"})
+        with pytest.raises(FormSubmissionRejected, match="method"):
+            middleware.process_response(request, response)
+
+        response = Response(
+            request.url, status=307, headers={"Location": "http://evil.example/login"}
+        )
+        with pytest.raises(FormSubmissionRejected, match="target"):
+            middleware.process_response(request, response)
+
+    def test_redirect_that_preserves_intent_is_allowed(self):
+        from scrapy.downloadermiddlewares.redirect import RedirectMiddleware
+        from scrapy.http import Response
+        from scrapy.utils.misc import build_from_crawler
+        from scrapy.utils.spider import DefaultSpider
+        from scrapy.utils.test import get_crawler
+
+        crawler = get_crawler(DefaultSpider)
+        crawler.spider = crawler._create_spider()
+        middleware = build_from_crawler(RedirectMiddleware, crawler)
+        request = FormRequest(
+            "http://example.com/login",
+            formdata={"username": "john", "password": "secret"},
+            submission_intent=_intent(),
+        )
+        response = Response(request.url, status=307, headers={"Location": "/login"})
+        redirected = middleware.process_response(request, response)
+        assert isinstance(redirected, Request)
+        assert redirected.url == request.url
+        assert redirected.method == "POST"
+        assert redirected.submission_intent is request.submission_intent
+
+    def test_no_values_in_redirect_rejection(self):
+        from scrapy.downloadermiddlewares.redirect import RedirectMiddleware
+        from scrapy.http import Response
+        from scrapy.utils.misc import build_from_crawler
+        from scrapy.utils.spider import DefaultSpider
+        from scrapy.utils.test import get_crawler
+
+        crawler = get_crawler(DefaultSpider)
+        crawler.spider = crawler._create_spider()
+        middleware = build_from_crawler(RedirectMiddleware, crawler)
+        request = FormRequest(
+            "http://example.com/login",
+            formdata={"username": "john", "password": "hunter2"},
+            submission_intent=_intent(),
+        )
+        response = Response(request.url, status=301, headers={"Location": "/login"})
+        with pytest.raises(FormSubmissionRejected) as excinfo:
+            middleware.process_response(request, response)
+        message = str(excinfo.value)
+        assert "john" not in message
+        assert "hunter2" not in message
+
+    def test_serialization_round_trip(self):
+        from scrapy.utils.request import request_from_dict
+
+        intent = _intent()
+        request = FormRequest(
+            "http://example.com/login",
+            formdata={"username": "john", "password": "secret"},
+            submission_intent=intent,
+        )
+        restored = request_from_dict(request.to_dict())
+        assert isinstance(restored, FormRequest)
+        assert restored.submission_intent is intent
+        assert restored.body == request.body
+
+    def test_credentials_in_url_are_not_used_for_matching(self):
+        response = _buildresponse(
+            """<form action="https://user:secret@example.com/login" method="POST">
+            <input name="username" value="">
+            <input name="password" value="">
+            </form>"""
+        )
+        with pytest.raises(ValueError, match="must not have credentials") as excinfo:
+            FormSubmissionIntent(
+                targets=["https://user:secret@example.com/login"],
+                methods=["POST"],
+                field_categories={"credentials": ["username", "password"]},
+            )
+        assert "secret" not in str(excinfo.value)
+
+        with pytest.raises(FormSubmissionRejected, match="credentials") as excinfo:
+            FormRequest.from_response(
+                response,
+                formdata={"username": "john", "password": "hunter2"},
+                submission_intent=FormSubmissionIntent(
+                    targets=["https://example.com/login"],
+                    methods=["POST"],
+                    field_categories={"credentials": ["username", "password"]},
+                ),
+            )
+        assert "secret" not in str(excinfo.value)
+
+    def test_query_string_field_is_rejected(self):
+        response = _buildresponse(
+            """<form action="/login?campaign=promo" method="POST">
+            <input name="username" value="">
+            <input name="password" value="">
+            </form>"""
+        )
+        with pytest.raises(FormSubmissionRejected, match="'campaign'"):
+            FormRequest.from_response(
+                response,
+                formdata={"username": "john", "password": "hunter2"},
+                submission_intent=_intent(targets=["http://example.com/login"]),
+            )
+
+    def test_multiple_forms_each_with_own_intent(self):
+        response = _buildresponse(
+            """<form name="search" action="/search" method="GET">
+            <input name="q" value="">
+            </form>
+            <form name="login" action="/login" method="POST">
+            <input name="username" value="">
+            <input name="password" value="">
+            </form>""",
+            url="http://example.com/account/",
+        )
+        search = FormRequest.from_response(
+            response,
+            formname="search",
+            formdata={"q": "scrapy"},
+            submission_intent=FormSubmissionIntent(
+                targets=["http://example.com/search"],
+                methods=["GET"],
+                field_categories={"query": ["q"]},
+            ),
+        )
+        login = FormRequest.from_response(
+            response,
+            formname="login",
+            formdata={"username": "john", "password": "secret"},
+            submission_intent=_intent(),
+        )
+        assert search.url == "http://example.com/search?q=scrapy"
+        assert login.url == "http://example.com/login"
+        assert search.submission_intent is not login.submission_intent
+
+    def test_intent_attributes_are_read_only(self):
+        intent = _intent()
+        categories = intent.field_categories
+        with pytest.raises(TypeError):
+            categories["new"] = frozenset({"field"})  # type: ignore[index]
+        assert "credentials" in categories
+
+    def test_action_query_parameter_can_be_approved(self):
+        response = _buildresponse(
+            """<form action="/login?campaign=promo" method="POST">
+            <input name="username" value="">
+            <input name="password" value="">
+            </form>"""
+        )
+        request = FormRequest.from_response(
+            response,
+            formdata={"username": "john", "password": "secret"},
+            submission_intent=_intent(
+                targets=["http://example.com/login"],
+                field_categories={
+                    "credentials": ["username", "password"],
+                    "campaign": ["campaign"],
+                },
+            ),
+        )
+        assert request.url == "http://example.com/login?campaign=promo"
+        assert _qs(request)[b"username"] == [b"john"]

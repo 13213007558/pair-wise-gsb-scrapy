@@ -7,7 +7,7 @@ Request and Response outside this module.
 
 from scrapy.http.headers import Headers
 from scrapy.http.request import Request
-from scrapy.http.request.form import FormRequest
+from scrapy.http.request.form import FormRequest, FormSubmissionIntent
 from scrapy.http.request.json_request import JsonRequest
 from scrapy.http.request.rpc import XmlRpcRequest
 from scrapy.http.response import Response
@@ -20,6 +20,7 @@ from scrapy.http.response.xml import XmlResponse
 __all__ = [
     "BodyFileResponse",
     "FormRequest",
+    "FormSubmissionIntent",
     "Headers",
     "HtmlResponse",
     "JsonRequest",

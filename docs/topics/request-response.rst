@@ -1203,6 +1203,16 @@ FormRequest
 
 .. autoclass:: scrapy.FormRequest
 
+.. autoclass:: scrapy.FormSubmissionIntent
+   :members:
+
+A submission intent is checked when the request is built, and again for
+requests derived from it, such as redirects and retries. When a check fails,
+:exc:`~scrapy.exceptions.FormSubmissionRejected` is raised before the request
+is sent. Its message names the target, method or fields that do not match
+without including field values, so it can be logged and shown to the user.
+
+
 JsonRequest
 -----------
 

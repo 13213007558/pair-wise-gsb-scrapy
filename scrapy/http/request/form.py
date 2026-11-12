@@ -8,14 +8,16 @@ See documentation in docs/topics/request-response.rst
 from __future__ import annotations
 
 from collections.abc import Iterable, Mapping
+from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, ClassVar, Self, TypeAlias, cast
-from urllib.parse import urlencode, urljoin, urlsplit, urlunsplit
+from urllib.parse import parse_qsl, urlencode, urljoin, urlsplit, urlunsplit
 from warnings import warn
 
 from parsel.csstranslator import HTMLTranslator
 from w3lib.html import strip_html5_whitespace
+from w3lib.url import canonicalize_url
 
-from scrapy.exceptions import ScrapyDeprecationWarning
+from scrapy.exceptions import FormSubmissionRejected, ScrapyDeprecationWarning
 from scrapy.http.request import Request
 from scrapy.utils.python import to_bytes
 
@@ -40,6 +42,150 @@ FormdataType: TypeAlias = (
 )
 
 
+class FormSubmissionIntent:
+    """A set of values approved for a form submission by the code that
+    creates the :class:`FormRequest`.
+
+    Pass an instance as the *submission_intent* parameter of a
+    :class:`FormRequest`, including through
+    :meth:`~scrapy.FormRequest.from_response`, to require that the request
+    that is finally sent still matches the approved target, method and fields.
+    The check is repeated for requests derived from that request, such as
+    redirects and retries, which stop the crawl with
+    :exc:`~scrapy.exceptions.FormSubmissionRejected` when they no longer
+    match.
+
+    :param targets: absolute URLs approved as submission targets. The form
+        ``action`` is resolved against the response URL before it is compared.
+        The query string and the fragment are not compared. Query parameters
+        of the form ``action`` are checked like the submitted field names.
+    :param methods: approved HTTP methods, e.g. ``"POST"``. They are compared
+        case-insensitively.
+    :param field_categories: maps a category name to the names of the fields
+        that belong to it, e.g.
+        ``{"credentials": ["username", "password"], "search": ["q"]}``. Every
+        field submitted by the request must be listed in one of the categories
+        in this mapping. Matching is by field name only; field values are not
+        stored or checked. A field name may only belong to one category.
+
+    For example:
+
+    .. code-block:: python
+
+        intent = FormSubmissionIntent(
+            targets=["https://example.com/users/login"],
+            methods=["POST"],
+            field_categories={
+                "credentials": ["username", "password"],
+                "csrf": ["csrf_token"],
+            },
+        )
+        yield FormRequest.from_response(
+            response,
+            formname="login",
+            formdata={"username": "john", "password": "secret"},
+            submission_intent=intent,
+        )
+
+    .. versionadded:: VERSION
+    """
+
+    __slots__ = ("_approved_field_names", "_field_categories", "_methods", "_targets")
+
+    def __init__(
+        self,
+        *,
+        targets: Iterable[str],
+        methods: Iterable[str],
+        field_categories: Mapping[str, Iterable[str]],
+    ) -> None:
+        self._targets = frozenset(
+            _normalize_target(target, "target") for target in _as_iterable(targets)
+        )
+        if not self._targets:
+            raise ValueError("targets must contain at least one URL")
+
+        self._methods = frozenset(
+            _normalize_method(method) for method in _as_iterable(methods)
+        )
+        if not self._methods:
+            raise ValueError("methods must contain at least one HTTP method")
+
+        categories: dict[str, frozenset[str]] = {}
+        owners: dict[str, str] = {}
+        for category, names in field_categories.items():
+            if not isinstance(category, str) or not category:
+                raise ValueError("field category names must be non-empty strings")
+            category_names = frozenset(
+                _normalize_field_name(name) for name in _as_iterable(names)
+            )
+            for name in category_names:
+                if name in owners:
+                    raise ValueError(
+                        f"field {name!r} belongs to more than one field category, "
+                        f"{owners[name]!r} and {category!r}"
+                    )
+                owners[name] = category
+            categories[category] = category_names
+        self._field_categories = categories
+        self._approved_field_names = frozenset(owners)
+
+    @property
+    def targets(self) -> frozenset[str]:
+        """The approved submission targets, normalized."""
+        return self._targets
+
+    @property
+    def methods(self) -> frozenset[str]:
+        """The approved HTTP methods, upper-cased."""
+        return self._methods
+
+    @property
+    def field_categories(self) -> Mapping[str, frozenset[str]]:
+        """The approved field categories and their field names."""
+        return MappingProxyType(self._field_categories)
+
+    def _check_request(self, request: Request) -> None:
+        """Reject *request* if it does not match the approved intent."""
+        parts = urlsplit(request.url)
+        if parts.username or parts.password:
+            raise FormSubmissionRejected(
+                "Form submission rejected: the request target contains "
+                "credentials, which approved targets cannot contain"
+            )
+        target = _target_key(request.url)
+        if target not in self._targets:
+            approved = _format_targets(self._targets)
+            raise FormSubmissionRejected(
+                f"Form submission rejected: request target "
+                f"{_display_target(target)!r} is not approved; approved "
+                f"targets: {approved}"
+            )
+
+        method = str(request.method).upper()
+        if method not in self._methods:
+            approved = ", ".join(sorted(self._methods))
+            raise FormSubmissionRejected(
+                f"Form submission rejected: request method {method!r} is not "
+                f"approved; approved methods: {approved}"
+            )
+
+        field_names = _get_request_field_names(request)
+        if field_names is None:
+            raise FormSubmissionRejected(
+                "Form submission rejected: the request body cannot be checked "
+                "against the approved field categories; only "
+                "application/x-www-form-urlencoded form data is supported"
+            )
+        unapproved = sorted(field_names - self._approved_field_names)
+        if unapproved:
+            raise FormSubmissionRejected(
+                f"Form submission rejected: form fields {unapproved} are not "
+                f"approved; add them to an approved field category or remove "
+                f"them from the form data"
+            )
+
+
 class FormRequest(Request):
     """A :class:`~scrapy.Request` subclass with a ``formdata`` parameter that
     url-encodes the given data and assigns it to the request, which makes it
@@ -60,6 +206,11 @@ class FormRequest(Request):
        the request body; if the method is ``"GET"``, the data is added to the
        URL query string instead.
     :type formdata: dict or collections.abc.Iterable
+
+    *submission_intent* optionally restricts the submission to an approved
+    target, method and set of field names. The request is checked when it is
+    built, and requests derived from it, such as redirects and retries, are
+    checked again before they are sent.
 
     To send data via HTTP POST, simulating an HTML form submission, return a
     :class:`~scrapy.FormRequest` object from your spider:
@@ -90,17 +241,24 @@ class FormRequest(Request):
         ]
     """
 
-    __slots__ = ()
+    __slots__ = ("_submission_intent",)
+
+    attributes: tuple[str, ...] = (*Request.attributes, "submission_intent")
 
     valid_form_methods: ClassVar[list[str]] = ["GET", "POST"]
 
     def __init__(
-        self, *args: Any, formdata: FormdataType = None, **kwargs: Any
+        self,
+        *args: Any,
+        formdata: FormdataType = None,
+        submission_intent: FormSubmissionIntent | None = None,
+        **kwargs: Any,
     ) -> None:
         if formdata and kwargs.get("method") is None:
             kwargs["method"] = "POST"
 
         super().__init__(*args, **kwargs)
+        self._submission_intent = submission_intent
 
         if formdata:
             items = formdata.items() if isinstance(formdata, Mapping) else formdata
@@ -115,6 +273,18 @@ class FormRequest(Request):
                     urlunsplit(urlsplit(self.url)._replace(query=form_query_str))
                 )
 
+        if submission_intent is not None:
+            submission_intent._check_request(self)
+
+    @property
+    def submission_intent(self) -> FormSubmissionIntent | None:
+        """The :class:`FormSubmissionIntent` that the request must match,
+        or ``None``.
+
+        .. versionadded:: VERSION
+        """
+        return self._submission_intent
+
     @classmethod
     def from_response(
         cls,
@@ -127,6 +297,7 @@ class FormRequest(Request):
         dont_click: bool = False,
         formxpath: str | None = None,
         formcss: str | None = None,
+        submission_intent: FormSubmissionIntent | None = None,
         **kwargs: Any,
     ) -> Self:
         warn(
@@ -151,7 +322,105 @@ class FormRequest(Request):
             if method not in cls.valid_form_methods:
                 method = "GET"
 
-        return cls(url=url, method=method, formdata=formdata, **kwargs)
+        return cls(
+            url=url,
+            method=method,
+            formdata=formdata,
+            submission_intent=submission_intent,
+            **kwargs,
+        )
+
+
+def _as_iterable(value: Any) -> Iterable[Any]:
+    """Return *value* as an iterable, treating strings as single items."""
+    if isinstance(value, (str, bytes)):
+        return (value,)
+    return value
+
+
+def _format_targets(targets: Iterable[str]) -> str:
+    return ", ".join(sorted(targets))
+
+
+def _normalize_target(target: str, name: str) -> str:
+    if not isinstance(target, str):
+        raise TypeError(f"{name} must be a string, got {type(target).__name__}")
+    if "://" not in target:
+        raise ValueError(
+            f"{name} {_display_target(target)!r} is not an absolute URL; "
+            f"resolve relative URLs before approving them"
+        )
+    parts = urlsplit(target)
+    if parts.username or parts.password:
+        raise ValueError(
+            f"{name} {_display_target(target)!r} must not have credentials"
+        )
+    if parts.fragment:
+        raise ValueError(f"{name} {_display_target(target)!r} must not have a fragment")
+    return _target_key(target)
+
+
+def _target_key(url: str) -> str:
+    """Return the canonical path-level form of *url* used to compare targets.
+
+    The query string is left out: for ``GET`` submissions it holds the form
+    data, whose field names are checked against the approved field
+    categories.
+    """
+    parts = urlsplit(canonicalize_url(url))
+    netloc = parts.hostname or ""
+    default_port = {"http": 80, "https": 443}.get(parts.scheme)
+    if parts.port is not None and parts.port != default_port:
+        netloc = f"{netloc}:{parts.port}"
+    return urlunsplit((parts.scheme, netloc, parts.path, "", ""))
+
+
+def _normalize_method(method: str) -> str:
+    if not isinstance(method, str):
+        raise TypeError(f"method must be a string, got {type(method).__name__}")
+    method = method.upper()
+    if not method:
+        raise ValueError("methods must not contain empty values")
+    return method
+
+
+def _normalize_field_name(name: str) -> str:
+    if not isinstance(name, str) or not name:
+        raise ValueError("field names must be non-empty strings")
+    return name
+
+
+def _display_target(target: str) -> str:
+    """Return a URL for an error message, without credentials, query or
+    fragments."""
+    parts = urlsplit(target)
+    netloc = parts.hostname or ""
+    if parts.port is not None:
+        netloc = f"{netloc}:{parts.port}"
+    return urlunsplit((parts.scheme, netloc, parts.path, "", ""))
+
+
+def _get_request_field_names(request: Request) -> frozenset[str] | None:
+    """Return the names of the form fields that *request* would submit, or
+    ``None`` if the body is not url-encoded form data."""
+    names = _query_names(urlsplit(request.url).query)
+    if request.method != "POST":
+        return frozenset(names)
+    if not request.body:
+        return frozenset(names)
+    content_type = request.headers.get("Content-Type", b"")
+    if content_type:
+        if not isinstance(content_type, bytes):
+            return None
+        scheme = content_type.partition(b";")[0].strip().lower()
+        if scheme != b"application/x-www-form-urlencoded":
+            return None
+    names.update(_query_names(request.body.decode(request.encoding)))
+    return frozenset(names)
+
+
+def _query_names(query: str) -> set[str]:
+    return {name for name, _ in parse_qsl(query, keep_blank_values=True)}
 
 
 def _get_form_url(form: FormElement, url: str | None) -> str:

@@ -306,6 +306,15 @@ and a crawl that spans multiple domains can leak them to unintended hosts:
   intended domain rather than ``None`` so that credentials are not sent to
   every domain you crawl.
 
+  The middleware records each decision to attach a credential as a trusted,
+  in-memory binding on the request rather than trusting copyable
+  :attr:`~scrapy.Request.meta`. The binding is scoped to the origin it was
+  granted for: retries keep it, while a redirect or other derived request that
+  changes the origin drops it and is re-evaluated through the
+  :setting:`HTTPAUTH_BINDING_POLICY`. Bindings are neither exposed through meta
+  nor written to serialized or pickled requests, and a denied request carries
+  no credential material.
+
 * The ``Referer`` header may disclose the URLs you crawl to other sites. The
   default :setting:`REFERRER_POLICY` already avoids sending the referrer from
   HTTPS to HTTP, but you can tighten it further (for example, to

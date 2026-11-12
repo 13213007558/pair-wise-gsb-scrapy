@@ -17,6 +17,7 @@ from typing import (
     TYPE_CHECKING,
     Any,
     Concatenate,
+    Iterable,
     NoReturn,
     NotRequired,
     Self,
@@ -36,12 +37,13 @@ from scrapy.utils.python import to_bytes
 from scrapy.utils.trackref import object_ref
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Generator, Iterable, Mapping
+    from collections.abc import Callable, Generator, Mapping
 
     from twisted.python.failure import Failure
 
     # circular import
     from scrapy.crawler import Crawler
+    from scrapy.downloadermiddlewares.httpauth import AuthBinding
     from scrapy.http import Response
 
     CallbackT: TypeAlias = Callable[Concatenate[Response, ...], Any]
@@ -61,6 +63,16 @@ _active_crawler: ContextVar[Crawler | None] = ContextVar(
 _in_download_handler: ContextVar[bool] = ContextVar(
     "_in_download_handler", default=False
 )
+
+
+def _as_slot_tuple(slots: str | Iterable[str]) -> tuple[str, ...]:
+    """Normalize a class ``__slots__`` value to a tuple of slot names.
+
+    ``__slots__`` may be declared as a single string instead of a sequence.
+    """
+    if isinstance(slots, str):
+        return (slots,)
+    return tuple(slots)
 
 
 @contextmanager
@@ -204,6 +216,7 @@ class Request(object_ref):
 
     __slots__ = (
         "__weakref__",
+        "_auth_binding",
         "_body",
         "_cb_kwargs",
         "_cookies",
@@ -339,6 +352,12 @@ class Request(object_ref):
         self._cb_kwargs: dict[str, Any] | None = dict(cb_kwargs) if cb_kwargs else None
         self._flags: list[str] | None = list(flags) if flags else None
 
+        # Trusted, in-memory record of the credential binding that authorized
+        # this request. It is not part of meta, so it cannot be forged or
+        # copied through the public API, and it is intentionally absent from
+        # dict/serialized forms. Downloader middlewares manage it.
+        self._auth_binding: AuthBinding | None = None
+
         self.parent_id: int | None = parent_id
         """:attr:`id` of the request this request derives from, or ``None``.
 
@@ -370,6 +389,40 @@ class Request(object_ref):
         if self._meta is None:
             self._meta = {}
         return self._meta
+
+    @property
+    def _trusted_auth_binding(self) -> AuthBinding | None:
+        """The credential binding granted to this request by the configured
+        binding policy, or ``None`` if none was granted.
+
+        Read by the HTTP auth middleware; not reachable through :attr:`meta`,
+        dict serialization or copies to another origin.
+        """
+        return self._auth_binding
+
+    def _set_trusted_auth_binding(self, binding: AuthBinding | None) -> None:
+        self._auth_binding = binding
+
+    def __getstate__(self) -> dict[str, Any]:
+        # The binding holds an encoded credential and is only valid in the
+        # crawl that granted it. Never persist it, e.g. in disk job queues.
+        slots = (
+            slot
+            for klass in type(self).__mro__
+            for slot in _as_slot_tuple(getattr(klass, "__slots__", ()))
+        )
+        state = {
+            slot: getattr(self, slot)
+            for slot in slots
+            if slot != "__weakref__" and hasattr(self, slot)
+        }
+        state["_auth_binding"] = None
+        return state
+
+    def __setstate__(self, state: dict[str, Any]) -> None:
+        for slot, value in state.items():
+            setattr(self, slot, value)
+        self._auth_binding = None
 
     @property
     def url(self) -> str:
@@ -504,7 +557,15 @@ class Request(object_ref):
             kwargs.setdefault(x, getattr(self, x))
         if cls is None:
             cls = self.__class__
-        return cls(*args, **kwargs)
+        new_request = cls(*args, **kwargs)
+        # A credential binding is trusted only for the origin it was granted
+        # for. Carry it over when the derived request keeps the same origin
+        # (e.g. retries), drop it when the origin changes so the credential has
+        # to be re-evaluated (e.g. cross-site redirects).
+        binding = self._auth_binding
+        if binding is not None and binding.is_for_origin(new_request):
+            new_request._auth_binding = binding
+        return new_request
 
     @classmethod
     def from_curl(

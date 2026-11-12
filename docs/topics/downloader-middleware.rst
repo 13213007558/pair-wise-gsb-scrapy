@@ -305,6 +305,18 @@ HttpAuthMiddleware
     the credentials per request via :attr:`~scrapy.Request.meta` keys
     :reqmeta:`http_user`, :reqmeta:`http_pass`, and :reqmeta:`http_auth_domain`.
 
+    The decision to attach a credential to a request is taken by the configured
+    :setting:`HTTPAUTH_BINDING_POLICY` and recorded as a trusted, in-memory
+    binding on the request. The binding is not part of
+    :attr:`~scrapy.Request.meta`, so it cannot be forged or copied through the
+    public API, and it is not written to serialized or pickled requests. A
+    binding is valid only for the origin (scheme, host and port) it was
+    granted for. Retries of the same request keep it, while a redirect or
+    another derived request that changes the origin drops it and is evaluated
+    again, so a credential never reaches a different origin unless the policy
+    grants it anew. A request that carries an explicit ``Authorization``
+    header is left untouched.
+
     Example using settings (e.g. in :attr:`~scrapy.Spider.custom_settings`):
 
     .. code-block:: python
@@ -377,6 +389,29 @@ that this risks leaking credentials to unrelated domains.
 
 This setting must be explicitly configured whenever :setting:`HTTPAUTH_USER`
 or :setting:`HTTPAUTH_PASS` is set.
+
+.. setting:: HTTPAUTH_BINDING_POLICY
+
+HTTPAUTH_BINDING_POLICY
+~~~~~~~~~~~~~~~~~~~~~~~
+
+.. versionadded:: VERSION
+
+Default: ``"scrapy.downloadermiddlewares.httpauth.HttpAuthPolicy"``
+
+The path to the class that decides which credential, if any, a request is
+allowed to present. The default policy grants the per-request credentials
+from :reqmeta:`http_user` and :reqmeta:`http_pass` first, pinning them to
+the request origin when :reqmeta:`http_auth_domain` is not set, and
+otherwise falls back to the :setting:`HTTPAUTH_USER`,
+:setting:`HTTPAUTH_PASS`, and :setting:`HTTPAUTH_DOMAIN` settings.
+
+Subclass
+:class:`~scrapy.downloadermiddlewares.httpauth.HttpAuthPolicy` and override
+its :meth:`~scrapy.downloadermiddlewares.httpauth.HttpAuthPolicy.bind`
+method to implement application-specific rules, for example credentials
+chosen from an approved per-site registry. A policy that denies a request
+returns ``None`` and does not expose the credential.
 
 .. seealso:: :ref:`security-credential-leakage`
 

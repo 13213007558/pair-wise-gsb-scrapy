@@ -1,10 +1,17 @@
+from __future__ import annotations
+
+import json
 import logging
+import socket
 from collections.abc import Iterable
 from dataclasses import dataclass
-from typing import Any, NamedTuple
+from typing import TYPE_CHECKING, Any, NamedTuple
+from urllib.parse import urlencode
 
 import pytest
 from _pytest.mark import ParameterSet
+
+import aiodns
 
 from scrapy.downloadermiddlewares.cookies import CookiesMiddleware
 from scrapy.downloadermiddlewares.defaultheaders import DefaultHeadersMiddleware
@@ -12,11 +19,19 @@ from scrapy.downloadermiddlewares.redirect import RedirectMiddleware
 from scrapy.exceptions import NotConfigured
 from scrapy.http import Request, Response
 from scrapy.http.request import CookiesT, VerboseCookie
+from scrapy.spiders import Spider
 from scrapy.utils.misc import build_from_crawler
 from scrapy.utils.python import to_bytes
+from scrapy.utils.reactor import is_reactor_installed
 from scrapy.utils.request import _to_verbose_cookies
 from scrapy.utils.spider import DefaultSpider
 from scrapy.utils.test import get_crawler
+from tests.utils.decorators import coroutine_test
+
+if TYPE_CHECKING:
+    from collections.abc import AsyncIterator
+
+    from tests.mockserver.http import MockServer
 
 UNSET = object()
 
@@ -1231,3 +1246,440 @@ class TestCookiesMiddleware:
         request = Request("data:,", cookies={"a": "b"})
         assert self.mw.process_request(request) is None
         assert "Cookie" not in request.headers
+
+
+_ACCOUNT_DOMAINS = ("a.example", "b.example")
+_ACCOUNT_IDS = ("account-a", "account-b")
+_EXPLICIT_COOKIE = "explicit=one"
+
+
+class _SharedJarMiddleware(CookiesMiddleware):
+    """Pretend every request uses the same cookie jar, as a middleware that
+    ignored the ``cookiejar`` meta key would."""
+
+    def process_request(self, request: Request) -> Request | Response | None:
+        request.meta["cookiejar"] = "shared"
+        return super().process_request(request)
+
+    def process_response(self, request: Request, response: Response) -> Response:
+        request.meta["cookiejar"] = "shared"
+        return super().process_response(request, response)
+
+
+class _RedirectJarSwapMiddleware(CookiesMiddleware):
+    """Give the request created for a redirect the jar key of the other
+    account, as a redirect implementation that rebuilt the meta instead of
+    copying it might."""
+
+    def process_request(self, request: Request) -> Request | Response | None:
+        if request.meta.get("redirect_times"):
+            request.meta["cookiejar"] = (
+                _ACCOUNT_IDS[1]
+                if request.meta.get("cookiejar") == _ACCOUNT_IDS[0]
+                else _ACCOUNT_IDS[0]
+            )
+        return super().process_request(request)
+
+
+class _ResponseJarSwapMiddleware(CookiesMiddleware):
+    """Store every Set-Cookie response in the jar of the first account, as a
+    middleware that read the jar key from the wrong request would."""
+
+    def process_response(self, request: Request, response: Response) -> Response:
+        request.meta["cookiejar"] = _ACCOUNT_IDS[0]
+        return super().process_response(request, response)
+
+
+def _jar_cookie_names(middleware: CookiesMiddleware, jar_key: str) -> set[str]:
+    jar = middleware.jars[jar_key]
+    return {cookie.name for cookie in jar}
+
+
+def _sent_cookie_names(request: Request) -> set[str]:
+    header = request.headers.get("Cookie")
+    if header is None:
+        return set()
+    return {part.split(b"=", 1)[0].decode() for part in header.split(b"; ")}
+
+
+class TestCookieJarIsolation:
+    """Two accounts, each with its own cookie jar, on two controlled domains.
+
+    Every scenario runs the request through the real cookie and redirect
+    middlewares and checks both the resulting Cookie header and the contents
+    of both jars, so that a cookie from one account ending up in the other
+    account's jar or request is detected. The fault variants are broken
+    middleware implementations, each failing at a single step of the chain;
+    they are expected to fail (xfail) only the tests that cover that step,
+    which pinpoints where the contamination happens.
+    """
+
+    def setup_method(self):
+        crawler = get_crawler(DefaultSpider)
+        crawler.spider = crawler._create_spider()
+        self.crawler = crawler
+        self.redirect_middleware = build_from_crawler(RedirectMiddleware, crawler)
+
+    def _middleware(self, variant: type[CookiesMiddleware]) -> CookiesMiddleware:
+        return build_from_crawler(variant, self.crawler)
+
+    @staticmethod
+    def _request(account: str, url: str, **kwargs: Any) -> Request:
+        kwargs.setdefault("meta", {})["cookiejar"] = account
+        return Request(url, **kwargs)
+
+    def _redirect(
+        self, middleware: CookiesMiddleware, request: Request, location: str
+    ) -> Request:
+        response = Response(
+            request.url,
+            status=302,
+            headers={"Location": location},
+        )
+        assert middleware.process_response(request, response) is response
+        redirected = self.redirect_middleware.process_response(request, response)
+        assert isinstance(redirected, Request)
+        return redirected
+
+    @pytest.mark.parametrize(
+        "variant",
+        [
+            pytest.param(CookiesMiddleware, id="correct"),
+            pytest.param(
+                _SharedJarMiddleware,
+                id="shared-jar",
+                marks=pytest.mark.xfail(
+                    strict=True,
+                    reason="request cookies of one account reach the other jar",
+                ),
+            ),
+        ],
+    )
+    def test_request_cookies_stay_in_own_jar(
+        self, variant: type[CookiesMiddleware]
+    ) -> None:
+        middleware = self._middleware(variant)
+
+        for account, domain in zip(_ACCOUNT_IDS, _ACCOUNT_DOMAINS, strict=True):
+            request = self._request(
+                account,
+                f"http://{domain}/",
+                cookies={"session": account},
+            )
+            middleware.process_request(request)
+            assert _sent_cookie_names(request) == {"session"}
+
+        assert set(middleware.jars) == set(_ACCOUNT_IDS)
+        for account in _ACCOUNT_IDS:
+            assert _jar_cookie_names(middleware, account) == {"session"}
+            other = next(key for key in _ACCOUNT_IDS if key != account)
+            assert {
+                cookie.value
+                for cookie in middleware.jars[other]
+                if cookie.name == "session"
+            } != {account}
+
+    def test_explicit_cookie_header_does_not_populate_any_jar(self) -> None:
+        # The cookie middleware rebuilds the Cookie header from the jar, so a
+        # Cookie header set explicitly is not merged into a jar; it must still
+        # not end up in either account's jar.
+        middleware = self._middleware(CookiesMiddleware)
+
+        for account, domain in zip(_ACCOUNT_IDS, _ACCOUNT_DOMAINS, strict=True):
+            request = self._request(
+                account,
+                f"http://{domain}/",
+                headers={"Cookie": _EXPLICIT_COOKIE},
+            )
+            middleware.process_request(request)
+            assert _sent_cookie_names(request) == set()
+
+        for account in _ACCOUNT_IDS:
+            assert _jar_cookie_names(middleware, account) == set()
+
+    @pytest.mark.parametrize(
+        "variant",
+        [
+            pytest.param(CookiesMiddleware, id="correct"),
+            pytest.param(
+                _SharedJarMiddleware,
+                id="shared-jar",
+                marks=pytest.mark.xfail(
+                    strict=True,
+                    reason="a copied request inherits the other account's jar",
+                ),
+            ),
+        ],
+    )
+    def test_request_copy_keeps_jar(
+        self, variant: type[CookiesMiddleware]
+    ) -> None:
+        middleware = self._middleware(variant)
+
+        for account, domain in zip(_ACCOUNT_IDS, _ACCOUNT_DOMAINS, strict=True):
+            login = self._request(
+                account, f"http://{domain}/login", cookies={"session": account}
+            )
+            middleware.process_request(login)
+            response = Response(
+                login.url,
+                headers={"Set-Cookie": f"server={account}; Path=/"},
+            )
+            middleware.process_response(login, response)
+
+            followup = login.copy()
+            assert followup.meta["cookiejar"] == account
+            middleware.process_request(followup)
+            assert _sent_cookie_names(followup) == {"server", "session"}
+
+        for account in _ACCOUNT_IDS:
+            assert _jar_cookie_names(middleware, account) == {"server", "session"}
+            other = next(key for key in _ACCOUNT_IDS if key != account)
+            other_cookies = {
+                cookie.name: cookie.value
+                for cookie in middleware.jars[other]
+            }
+            assert other_cookies.get("session") != account
+            assert other_cookies.get("server") != account
+
+    @pytest.mark.parametrize(
+        "variant",
+        [
+            pytest.param(CookiesMiddleware, id="correct"),
+            pytest.param(
+                _SharedJarMiddleware,
+                id="shared-jar",
+                marks=pytest.mark.xfail(
+                    strict=True,
+                    reason="the redirect request resolves to the shared jar",
+                ),
+            ),
+            pytest.param(
+                _RedirectJarSwapMiddleware,
+                id="redirect-jar-swap",
+                marks=pytest.mark.xfail(
+                    strict=True,
+                    reason="the redirect request inherits the other account's jar",
+                ),
+            ),
+        ],
+    )
+    def test_redirect_keeps_jar(
+        self, variant: type[CookiesMiddleware]
+    ) -> None:
+        middleware = self._middleware(variant)
+
+        for account, domain in zip(_ACCOUNT_IDS, _ACCOUNT_DOMAINS, strict=True):
+            login = self._request(
+                account, f"http://{domain}/login", cookies={"session": account}
+            )
+            middleware.process_request(login)
+            redirected = self._redirect(
+                middleware, login, f"http://{domain}/landing"
+            )
+            assert redirected.meta["cookiejar"] == account
+            middleware.process_request(redirected)
+            assert _sent_cookie_names(redirected) == {"session"}
+
+        for account in _ACCOUNT_IDS:
+            assert _jar_cookie_names(middleware, account) == {"session"}
+            other = next(key for key in _ACCOUNT_IDS if key != account)
+            assert {
+                cookie.value
+                for cookie in middleware.jars[other]
+                if cookie.name == "session"
+            } != {account}
+
+    @pytest.mark.parametrize(
+        "variant",
+        [
+            pytest.param(CookiesMiddleware, id="correct"),
+            pytest.param(
+                _SharedJarMiddleware,
+                id="shared-jar",
+                marks=pytest.mark.xfail(
+                    strict=True,
+                    reason="Set-Cookie responses land in the shared jar",
+                ),
+            ),
+            pytest.param(
+                _ResponseJarSwapMiddleware,
+                id="response-jar-swap",
+                marks=pytest.mark.xfail(
+                    strict=True,
+                    reason="Set-Cookie responses are stored in the wrong jar",
+                ),
+            ),
+        ],
+    )
+    def test_set_cookie_goes_to_own_jar(
+        self, variant: type[CookiesMiddleware]
+    ) -> None:
+        middleware = self._middleware(variant)
+
+        for account, domain in zip(_ACCOUNT_IDS, _ACCOUNT_DOMAINS, strict=True):
+            request = self._request(account, f"http://{domain}/")
+            middleware.process_request(request)
+            response = Response(
+                request.url,
+                headers={"Set-Cookie": f"token={account}; Path=/"},
+            )
+            middleware.process_response(request, response)
+
+            followup = self._request(account, f"http://{domain}/dashboard")
+            middleware.process_request(followup)
+            assert _sent_cookie_names(followup) == {"token"}
+
+        for account in _ACCOUNT_IDS:
+            jar = middleware.jars[account]
+            assert _jar_cookie_names(middleware, account) == {"token"}
+            assert {cookie.value for cookie in jar} == {account}
+            other = next(key for key in _ACCOUNT_IDS if key != account)
+            assert "token" not in middleware.jars[other]
+
+
+class _AccountIsolationSpider(Spider):
+    """Crawl two controlled domains with one cookie jar per account.
+
+    For each account, the mock server first sets a cookie, then a redirect and
+    a copy of a request are followed, and a request carrying an explicit
+    Cookie header is sent. Every :file:`/echo` response reports the Cookie
+    header it received, which the spider stores for the test to inspect.
+    """
+
+    name = "account_isolation"
+    custom_settings = {
+        "DOWNLOAD_HANDLERS": {
+            "http": "scrapy.core.downloader.handlers._aiohttp.AiohttpDownloadHandler",
+        },
+    }
+
+    def __init__(self, port: int, **kwargs: Any) -> None:
+        super().__init__(**kwargs)
+        self.port = port
+        self.echoes: list[dict[str, str]] = []
+
+    def _url(self, domain: str, path: str) -> str:
+        return f"http://{domain}:{self.port}/{path}"
+
+    async def start(self) -> AsyncIterator[Request]:
+        for account, domain in zip(_ACCOUNT_IDS, _ACCOUNT_DOMAINS, strict=True):
+            meta = {"cookiejar": account}
+            login = Request(
+                self._url(domain, f"set-cookie?session={account}"),
+                meta=meta,
+                cookies={"bootstrap": account},
+                dont_filter=True,
+            )
+            yield login
+            yield Request(
+                self._url(
+                    domain,
+                    "redirect-to?"
+                    + urlencode({"goto": self._url(domain, "echo")}),
+                ),
+                meta=meta.copy(),
+                dont_filter=True,
+            )
+            yield login.copy()
+            yield Request(
+                self._url(domain, "echo"),
+                meta=meta.copy(),
+                headers={"Cookie": _EXPLICIT_COOKIE},
+                dont_filter=True,
+            )
+
+    def parse(self, response: Response) -> None:
+        if not response.body:
+            return
+        payload = json.loads(response.text)
+        headers = payload["headers"]
+        self.echoes.append(
+            {
+                "account": response.meta["cookiejar"],
+                "host": headers["Host"][0].split(":", 1)[0],
+                "cookie": headers.get("Cookie", [None])[0],
+            }
+        )
+
+
+class TestCookieJarIsolationFullChain:
+    """The same isolation checks as TestCookieJarIsolation, but with the
+    requests going through the downloader and the real middleware chain of a
+    crawler against the mock server."""
+
+    @pytest.fixture
+    def resolve_controlled_domains(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> Iterable[None]:
+        """Resolve every hostname to the loopback address of the mock server."""
+        real_getaddrinfo = socket.getaddrinfo
+
+        def getaddrinfo(host, port, *args, **kwargs):
+            return real_getaddrinfo("127.0.0.1", port, *args, **kwargs)
+
+        monkeypatch.setattr(socket, "getaddrinfo", getaddrinfo)
+
+        # aiohttp resolves through aiodns when it is installed, which uses
+        # c-ares instead of socket.getaddrinfo.
+        real_aiodns_getaddrinfo = aiodns.DNSResolver.getaddrinfo
+
+        def aiodns_getaddrinfo(self, host, *args, **kwargs):
+            return real_aiodns_getaddrinfo(self, "127.0.0.1", *args, **kwargs)
+
+        monkeypatch.setattr(aiodns.DNSResolver, "getaddrinfo", aiodns_getaddrinfo)
+
+        previous = None
+        if is_reactor_installed():
+            # A reactor's GAIResolver bound socket.getaddrinfo when it was
+            # imported, so it has to be given the patched one explicitly.
+            from twisted.internet import reactor  # noqa: PLC0415
+            from twisted.internet._resolver import GAIResolver  # noqa: PLC0415
+
+            previous = reactor.installNameResolver(
+                GAIResolver(reactor, getaddrinfo=getaddrinfo)
+            )
+        try:
+            yield
+        finally:
+            if previous is not None:
+                reactor.installNameResolver(previous)
+
+    @coroutine_test
+    async def test_accounts_stay_isolated_through_the_full_chain(
+        self, mockserver: MockServer, resolve_controlled_domains: None
+    ) -> None:
+        crawler = get_crawler(_AccountIsolationSpider)
+        await crawler.crawl_async(port=mockserver.port())
+        spider = crawler.spider
+        assert isinstance(spider, _AccountIsolationSpider)
+
+        accounts = dict(zip(_ACCOUNT_DOMAINS, _ACCOUNT_IDS, strict=True))
+        # One echo per account from each of the redirect, the copied request
+        # and the explicit-header request.
+        assert len(spider.echoes) == 6
+        for echo in spider.echoes:
+            account = accounts[echo["host"]]
+            assert echo["account"] == account
+            assert echo["cookie"] is not None
+            values = dict(
+                part.split("=", 1) for part in echo["cookie"].split("; ")
+            )
+            # The middleware rebuilds every Cookie header from the jar, so even
+            # the request carrying an explicit header only gets jar cookies,
+            # and only the cookies of its own account.
+            assert set(values) == {"bootstrap", "session"}
+            assert values["bootstrap"] == account
+            assert values["session"] == account
+
+        middleware = crawler.get_downloader_middleware(CookiesMiddleware)
+        assert isinstance(middleware, CookiesMiddleware)
+        assert set(middleware.jars) == set(_ACCOUNT_IDS)
+        for account in _ACCOUNT_IDS:
+            jar = middleware.jars[account]
+            assert {cookie.name for cookie in jar} == {"bootstrap", "session"}
+            assert {cookie.value for cookie in jar} == {account}
+            other = next(key for key in _ACCOUNT_IDS if key != account)
+            assert {
+                cookie.value for cookie in middleware.jars[other]
+            } != {account}

@@ -11,6 +11,7 @@ from typing import TYPE_CHECKING, Any, Self
 
 from scrapy.spidermiddlewares.base import BaseSpiderMiddleware
 from scrapy.utils.decorators import _warn_spider_arg
+from scrapy.utils.log import log_with_projection
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator, Iterable
@@ -116,9 +117,12 @@ class DepthMiddleware(BaseSpiderMiddleware):
             request.priority -= depth * self.prio
         if self.maxdepth and depth > self.maxdepth:
             if not self._ignored_logged:
-                logger.debug(
+                log_with_projection(
+                    logger,
+                    logging.DEBUG,
                     f"Ignoring link (depth > {self.maxdepth}): {request.url}"
                     " - no more ignored links will be shown",
+                    source=self.crawler,
                     extra={"spider": self.crawler.spider},
                 )
                 self._ignored_logged = True

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import warnings
 from itertools import chain
 from logging import getLogger
@@ -26,6 +27,7 @@ from scrapy.utils._download_handlers import get_warnsize
 from scrapy.utils.asyncio import run_in_thread
 from scrapy.utils.decorators import _warn_spider_arg
 from scrapy.utils.deprecate import warn_on_deprecated_spider_attribute
+from scrapy.utils.log import log_with_projection
 
 if TYPE_CHECKING:
     from scrapy.crawler import Crawler
@@ -67,11 +69,13 @@ class HttpCompressionMiddleware:
                 category=ScrapyDeprecationWarning,
                 stacklevel=2,
             )
+            self.crawler = None
             self.stats = stats
             self._max_size = 1073741824
             self._warn_size = 33554432
             self._max_encodings = 1
             return
+        self.crawler = crawler
         self.stats = crawler.stats
         self._max_size = crawler.settings.getint("DOWNLOAD_MAXSIZE")
         self._warn_size = crawler.settings.getint("DOWNLOAD_WARNSIZE")
@@ -125,7 +129,12 @@ class HttpCompressionMiddleware:
                     f"{e.decompressed_size} B decompressed so far) exceeded "
                     f"DOWNLOAD_MAXSIZE ({max_size} B) during decompression."
                 )
-                logger.warning(msg)
+                log_with_projection(
+                    logger,
+                    logging.WARNING,
+                    msg,
+                    source=self.crawler,
+                )
                 raise IgnoreRequest(msg) from e
             except _MaxEncodingCountExceeded as e:
                 msg = (
@@ -133,7 +142,12 @@ class HttpCompressionMiddleware:
                     f"header lists {e.count} supported encodings, which exceeds "
                     f"COMPRESSION_MAX_ENCODINGS ({e.max_count})."
                 )
-                logger.warning(msg)
+                log_with_projection(
+                    logger,
+                    logging.WARNING,
+                    msg,
+                    source=self.crawler,
+                )
                 raise IgnoreRequest(msg) from e
             except _DECOMPRESSION_ERRORS as e:
                 encodings = b", ".join(content_encoding).decode()
@@ -141,10 +155,13 @@ class HttpCompressionMiddleware:
                     f"Could not decompress {response} ({encodings}): {e}"
                 ) from e
             if len(response.body) < warn_size <= len(decoded_body):
-                logger.warning(
+                log_with_projection(
+                    logger,
+                    logging.WARNING,
                     f"{response} body size after decompression "
                     f"({len(decoded_body)} B) is larger than the "
-                    f"download warning size ({warn_size} B)."
+                    f"download warning size ({warn_size} B).",
+                    source=self.crawler,
                 )
             if content_encoding:
                 self._warn_unknown_encoding(response, content_encoding)
@@ -218,7 +235,10 @@ class HttpCompressionMiddleware:
         self, response: Response, encodings: list[bytes]
     ) -> None:
         encodings_str = b",".join(encodings).decode()
-        logger.warning(
+        log_with_projection(
+            logger,
+            logging.WARNING,
             f"{self.__class__.__name__} cannot decode the response for {response.url} "
-            f"from unsupported encoding(s) '{encodings_str}'."
+            f"from unsupported encoding(s) '{encodings_str}'.",
+            source=self.crawler,
         )

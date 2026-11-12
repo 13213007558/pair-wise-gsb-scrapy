@@ -8,6 +8,7 @@ from scrapy import Request, Spider, signals
 from scrapy.exceptions import IgnoreRequest
 from scrapy.utils.decorators import _warn_spider_arg
 from scrapy.utils.httpobj import urlparse_cached
+from scrapy.utils.log import log_with_projection
 
 if TYPE_CHECKING:
     from scrapy.crawler import Crawler
@@ -88,9 +89,12 @@ class OffsiteMiddleware:
         domain = urlparse_cached(request).hostname
         if domain and domain not in self.domains_seen:
             self.domains_seen.add(domain)
-            logger.debug(
+            log_with_projection(
+                logger,
+                logging.DEBUG,
                 "Filtered offsite request to %(domain)r: %(request)s",
                 {"domain": domain, "request": request},
+                source=self.crawler,
                 extra={"spider": self.crawler.spider},
             )
             self.stats.inc_value("offsite/domains")

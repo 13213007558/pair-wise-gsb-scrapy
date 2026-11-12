@@ -37,7 +37,7 @@ from scrapy.utils.defer import (
     maybe_deferred_to_future,
 )
 from scrapy.utils.deprecate import method_is_overridden
-from scrapy.utils.log import failure_to_exc_info, logformatter_adapter
+from scrapy.utils.log import failure_to_exc_info, log_formatter_result
 from scrapy.utils.misc import (
     build_from_crawler,
     load_object,
@@ -326,8 +326,10 @@ class Scraper:
                     logkws = self.logformatter.download_error(
                         result, request, self.crawler.spider
                     )
-                    logger.log(
-                        *logformatter_adapter(logkws),
+                    log_formatter_result(
+                        logger,
+                        logkws,
+                        crawler=self.crawler,
                         extra={"spider": self.crawler.spider},
                         exc_info=failure_to_exc_info(result),
                     )
@@ -456,8 +458,10 @@ class Scraper:
         logkws = self.logformatter.spider_error(
             failure, request, response, self.crawler.spider
         )
-        logger.log(
-            *logformatter_adapter(logkws),
+        log_formatter_result(
+            logger,
+            logkws,
+            crawler=self.crawler,
             exc_info=exc,
             extra={"spider": self.crawler.spider},
         )
@@ -598,8 +602,10 @@ class Scraper:
         except DropItem as ex:
             logkws = self.logformatter.dropped(item, ex, response, self.crawler.spider)
             if logkws is not None:
-                logger.log(
-                    *logformatter_adapter(logkws),
+                log_formatter_result(
+                    logger,
+                    logkws,
+                    crawler=self.crawler,
                     extra={"spider": self.crawler.spider, "item": item},
                 )
             await self.signals.send_catch_log_async(
@@ -613,8 +619,10 @@ class Scraper:
             logkws = self.logformatter.item_error(
                 item, ex, response, self.crawler.spider
             )
-            logger.log(
-                *logformatter_adapter(logkws),
+            log_formatter_result(
+                logger,
+                logkws,
+                crawler=self.crawler,
                 extra={"spider": self.crawler.spider, "item": item},
                 exc_info=True,
             )
@@ -628,8 +636,10 @@ class Scraper:
         else:
             logkws = self.logformatter.scraped(output, response, self.crawler.spider)
             if logkws is not None:
-                logger.log(
-                    *logformatter_adapter(logkws),
+                log_formatter_result(
+                    logger,
+                    logkws,
+                    crawler=self.crawler,
                     extra={"spider": self.crawler.spider, "item": output},
                 )
             await self.signals.send_catch_log_async(

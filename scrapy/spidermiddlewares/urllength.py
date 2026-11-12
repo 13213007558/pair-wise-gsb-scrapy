@@ -11,6 +11,7 @@ from typing import TYPE_CHECKING, Self
 
 from scrapy.exceptions import NotConfigured
 from scrapy.spidermiddlewares.base import BaseSpiderMiddleware
+from scrapy.utils.log import log_with_projection
 
 if TYPE_CHECKING:
     from scrapy.crawler import Crawler
@@ -40,9 +41,12 @@ class UrlLengthMiddleware(BaseSpiderMiddleware):
     ) -> Request | None:
         if len(request.url) <= self.maxlength:
             return request
-        logger.info(
+        log_with_projection(
+            logger,
+            logging.INFO,
             "Ignoring link (url length > %(maxlength)d): %(url)s ",
             {"maxlength": self.maxlength, "url": request.url},
+            source=self.crawler,
             extra={"spider": self.crawler.spider},
         )
         self.crawler.stats.inc_value("urllength/request_ignored_count")

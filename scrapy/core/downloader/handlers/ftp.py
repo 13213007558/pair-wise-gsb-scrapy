@@ -50,6 +50,7 @@ from scrapy.utils._download_handlers import (
 )
 from scrapy.utils.defer import maybe_deferred_to_future
 from scrapy.utils.httpobj import urlparse_cached
+from scrapy.utils.log import log_with_projection
 
 if TYPE_CHECKING:
     import os
@@ -72,6 +73,7 @@ class ReceivedDataProtocol(Protocol):
         maxsize: int = 0,
         warnsize: int = 0,
         body_file: str | os.PathLike[str] | None = None,
+        crawler: Crawler | None = None,
     ):
         self.__filename: bytes | None = filename
         self.body: BinaryIO
@@ -83,6 +85,7 @@ class ReceivedDataProtocol(Protocol):
             self.body = BytesIO()
         self.size: int = 0
         self._request: Request | None = request
+        self._crawler = crawler
         self._maxsize: int = maxsize
         self._warnsize: int = warnsize
         self._exceeded_maxsize: bool = False
@@ -101,10 +104,17 @@ class ReceivedDataProtocol(Protocol):
         ):
             self._reached_warnsize = True
             assert self._request is not None
-            logger.warning(
+            log_with_projection(
+                logger,
+                logging.WARNING,
                 get_warnsize_msg(
-                    self.size, self._warnsize, self._request, expected=False
-                )
+                    self.size,
+                    self._warnsize,
+                    self._request,
+                    expected=False,
+                    source=self._crawler,
+                ),
+                source=self._crawler,
             )
 
     @property
@@ -163,6 +173,7 @@ class FTPDownloadHandler(BaseDownloadHandler):
             maxsize=maxsize,
             warnsize=get_warnsize(request.meta, self._default_warnsize),
             body_file=body_file,
+            crawler=self.crawler,
         )
         try:
             if is_listing:
@@ -193,9 +204,15 @@ class FTPDownloadHandler(BaseDownloadHandler):
             client.transport.loseConnection()
         if protocol._exceeded_maxsize:
             warning_msg = get_maxsize_msg(
-                protocol.size, maxsize, request, expected=False
+                protocol.size,
+                maxsize,
+                request,
+                expected=False,
+                source=self.crawler,
             )
-            logger.warning(warning_msg)
+            log_with_projection(
+                logger, logging.WARNING, warning_msg, source=self.crawler
+            )
             raise DownloadCancelledError(warning_msg)
         headers = {"Local Filename": protocol.filename or b"", "Size": protocol.size}
         if body_file:

@@ -16,8 +16,10 @@ from scrapy.exceptions import (
     IgnoreRequest,
     NotConfigured,
 )
+from scrapy.utils._log_projection import _LogProjection
 from scrapy.utils.decorators import _warn_spider_arg
 from scrapy.utils.defer import maybe_deferred_to_future
+from scrapy.utils.log import log_with_projection
 from scrapy.utils.misc import load_object
 
 if TYPE_CHECKING:
@@ -96,7 +98,12 @@ class HttpCacheMiddleware:
             self.stats.inc_value("httpcache/miss")
             if self.ignore_missing:
                 self.stats.inc_value("httpcache/ignore")
-                raise IgnoreRequest(f"Ignored request not in cache: {request}")
+                projected_request = _LogProjection.from_crawler(
+                    self.crawler
+                ).project_request(request)
+                raise IgnoreRequest(
+                    f"Ignored request not in cache: {projected_request}"
+                )
             self._mark_downloading(request)
             return None  # first time request
 
@@ -121,9 +128,12 @@ class HttpCacheMiddleware:
             )
         except Exception:
             self.stats.inc_value("httpcache/retrieve_error")
-            logger.warning(
+            log_with_projection(
+                logger,
+                logging.WARNING,
                 f"Could not read the cache entry for {request}, treating it as a "
                 f"cache miss.",
+                source=self.crawler,
                 exc_info=True,
                 extra={"spider": self.crawler.spider},
             )

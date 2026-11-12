@@ -11,6 +11,7 @@ from warnings import warn
 from scrapy.exceptions import ScrapyDeprecationWarning
 from scrapy.utils.conf import _job_dir
 from scrapy.utils.deprecate import method_is_overridden
+from scrapy.utils.log import log_with_projection
 from scrapy.utils.request import (
     RequestFingerprinter,
     RequestFingerprinterProtocol,
@@ -161,16 +162,25 @@ class RFPDupeFilter(BaseDupeFilter):
 
     def log(self, request: Request, spider: Spider) -> None:
         if self.debug:
-            msg = "Filtered duplicate request: %(request)s (referer: %(referer)s)"
-            args = {"request": request, "referer": referer_str(request)}
-            self.logger.debug(msg, args, extra={"spider": spider})
+            log_with_projection(
+                self.logger,
+                logging.DEBUG,
+                "Filtered duplicate request: %(request)s (referer: %(referer)s)",
+                {"request": request, "referer": referer_str(request)},
+                source=spider.crawler,
+                extra={"spider": spider},
+            )
         elif self.logdupes:
-            msg = (
+            log_with_projection(
+                self.logger,
+                logging.DEBUG,
                 "Filtered duplicate request: %(request)s"
                 " - no more duplicates will be shown"
-                " (see DUPEFILTER_DEBUG to show all duplicates)"
+                " (see DUPEFILTER_DEBUG to show all duplicates)",
+                {"request": request},
+                source=spider.crawler,
+                extra={"spider": spider},
             )
-            self.logger.debug(msg, {"request": request}, extra={"spider": spider})
             self.logdupes = False
 
         spider.crawler.stats.inc_value("dupefilter/filtered")

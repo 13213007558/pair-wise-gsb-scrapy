@@ -37,6 +37,7 @@ from scrapy.utils._download_handlers import (
     normalize_bind_address,
 )
 from scrapy.utils.asyncio import is_asyncio_available
+from scrapy.utils.log import log_with_projection
 
 from ._base_http import BaseHttpDownloadHandler
 
@@ -183,13 +184,20 @@ class BaseStreamingDownloadHandler(BaseHttpDownloadHandler, Generic[_ResponseT])
         content_length = headers.get("Content-Length")
         expected_size = int(content_length) if content_length is not None else None
         if maxsize and expected_size and expected_size > maxsize:
-            self._cancel_maxsize(expected_size, maxsize, request, expected=True)
+            self._cancel_maxsize(
+                expected_size, maxsize, request, expected=True, source=self.crawler
+            )
 
         reached_warnsize = False
         if warnsize and expected_size and expected_size > warnsize:
             reached_warnsize = True
-            logger.warning(
-                get_warnsize_msg(expected_size, warnsize, request, expected=True)
+            log_with_projection(
+                logger,
+                logging.WARNING,
+                get_warnsize_msg(
+                    expected_size, warnsize, request, expected=True, source=self.crawler
+                ),
+                source=self.crawler,
             )
 
         make_response_base_args = self._build_base_response_args(
@@ -231,15 +239,26 @@ class BaseStreamingDownloadHandler(BaseHttpDownloadHandler, Generic[_ResponseT])
                     if maxsize and bytes_received > maxsize:
                         response_body.truncate(0)
                         self._cancel_maxsize(
-                            bytes_received, maxsize, request, expected=False
+                            bytes_received,
+                            maxsize,
+                            request,
+                            expected=False,
+                            source=self.crawler,
                         )
 
                     if warnsize and bytes_received > warnsize and not reached_warnsize:
                         reached_warnsize = True
-                        logger.warning(
+                        log_with_projection(
+                            logger,
+                            logging.WARNING,
                             get_warnsize_msg(
-                                bytes_received, warnsize, request, expected=False
-                            )
+                                bytes_received,
+                                warnsize,
+                                request,
+                                expected=False,
+                                source=self.crawler,
+                            ),
+                            source=self.crawler,
                         )
             except Exception as e:
                 return self._handle_body_exception(
@@ -277,7 +296,12 @@ class BaseStreamingDownloadHandler(BaseHttpDownloadHandler, Generic[_ResponseT])
             # let the timeout be reported as usual
             raise exc
         if not self._fail_on_dataloss_warned:
-            logger.warning(get_dataloss_msg(request.url))
+            log_with_projection(
+                logger,
+                logging.WARNING,
+                get_dataloss_msg(request.url, source=self.crawler),
+                source=self.crawler,
+            )
             self._fail_on_dataloss_warned = True
         raise ResponseDataLossError(str(exc)) from exc
 
@@ -305,10 +329,14 @@ class BaseStreamingDownloadHandler(BaseHttpDownloadHandler, Generic[_ResponseT])
                     pairs.append((name.decode(), value.decode()))
                 except UnicodeDecodeError:
                     str_name = name.decode(errors="replace")
-                    logger.warning(
-                        f"The {str_name} header of {request} is not valid UTF-8,"
-                        f" which {type(self).__name__} cannot send. Sending it"
-                        f" with U+FFFD in place of the invalid bytes."
+                    log_with_projection(
+                        logger,
+                        logging.WARNING,
+                        f"The {str_name} header of {request} is not valid"
+                        f" UTF-8, which {type(self).__name__} cannot send."
+                        f" Sending it with U+FFFD in place of the invalid"
+                        f" bytes.",
+                        source=self.crawler,
                     )
                     pairs.append((str_name, value.decode(errors="replace")))
         return pairs
@@ -334,10 +362,17 @@ class BaseStreamingDownloadHandler(BaseHttpDownloadHandler, Generic[_ResponseT])
 
     @staticmethod
     def _cancel_maxsize(
-        size: int, limit: int, request: Request, *, expected: bool
+        size: int,
+        limit: int,
+        request: Request,
+        *,
+        expected: bool,
+        source: Any = None,
     ) -> NoReturn:
-        warning_msg = get_maxsize_msg(size, limit, request, expected=expected)
-        logger.warning(warning_msg)
+        warning_msg = get_maxsize_msg(
+            size, limit, request, expected=expected, source=source
+        )
+        log_with_projection(logger, logging.WARNING, warning_msg, source=source)
         raise DownloadCancelledError(warning_msg)
 
     @staticmethod

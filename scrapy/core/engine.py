@@ -45,7 +45,7 @@ from scrapy.utils.defer import (
     maybe_deferred_to_future,
 )
 from scrapy.utils.deprecate import argument_is_required
-from scrapy.utils.log import failure_to_exc_info, logformatter_adapter
+from scrapy.utils.log import failure_to_exc_info, log_formatter_result
 from scrapy.utils.misc import build_from_crawler, load_object
 from scrapy.utils.python import global_object_name
 from scrapy.utils.reactor import CallLaterOnce
@@ -726,8 +726,10 @@ class ExecutionEngine:
                         result.request, result, self.spider
                     )
                     if logkws is not None:
-                        logger.log(
-                            *logformatter_adapter(logkws),
+                        log_formatter_result(
+                            logger,
+                            logkws,
+                            crawler=self.crawler,
                             extra={"spider": self.spider},
                         )
                     self.signals.send_catch_log(

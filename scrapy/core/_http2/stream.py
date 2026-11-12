@@ -27,6 +27,7 @@ from scrapy.utils._download_handlers import (
     make_response,
 )
 from scrapy.utils.httpobj import urlparse_cached
+from scrapy.utils.log import log_with_projection
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -362,8 +363,11 @@ class Stream:
                 self._download_warnsize,
                 self._request,
                 expected=False,
+                source=self._crawler,
             )
-            logger.warning(warning_msg)
+            log_with_projection(
+                logger, logging.WARNING, warning_msg, source=self._crawler
+            )
 
         # Acknowledge the data received
         self._protocol.conn.acknowledge_received_data(
@@ -399,9 +403,15 @@ class Stream:
         if self._log_warnsize:
             self.metadata["reached_warnsize"] = True
             warning_msg = get_warnsize_msg(
-                expected_size, self._download_warnsize, self._request, expected=True
+                expected_size,
+                self._download_warnsize,
+                self._request,
+                expected=True,
+                source=self._crawler,
             )
-            logger.warning(warning_msg)
+            log_with_projection(
+                logger, logging.WARNING, warning_msg, source=self._crawler
+            )
 
     def reset_stream(self, reason: StreamCloseReason = StreamCloseReason.RESET) -> None:
         """Close this stream by sending a RST_FRAME to the remote peer"""
@@ -459,8 +469,11 @@ class Stream:
                 self._download_maxsize,
                 self._request,
                 expected=reason == StreamCloseReason.MAXSIZE_EXCEEDED,
+                source=self._crawler,
             )
-            logger.error(error_msg)
+            log_with_projection(
+                logger, logging.ERROR, error_msg, source=self._crawler
+            )
             self._deferred_response.errback(DownloadCancelledError(error_msg))
 
         elif reason in {StreamCloseReason.ENDED, StreamCloseReason.STOP_DOWNLOAD}:

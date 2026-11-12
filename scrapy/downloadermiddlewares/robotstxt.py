@@ -18,6 +18,7 @@ from scrapy.http.request import NO_CALLBACK
 from scrapy.utils.decorators import _warn_spider_arg
 from scrapy.utils.defer import maybe_deferred_to_future
 from scrapy.utils.httpobj import urlparse_cached
+from scrapy.utils.log import log_with_projection
 from scrapy.utils.misc import build_from_crawler, load_object
 
 if TYPE_CHECKING:
@@ -167,9 +168,12 @@ class RobotsTxtMiddleware:
             useragent = request.headers.get(b"User-Agent", self._default_useragent)
             assert useragent is not None
         if not rp.allowed(request.url, useragent):
-            logger.debug(
+            log_with_projection(
+                logger,
+                logging.DEBUG,
                 "Forbidden by robots.txt: %(request)s",
                 {"request": request},
+                source=self.crawler,
                 extra={"spider": self.crawler.spider},
             )
             self._stats.inc_value("robotstxt/forbidden")
@@ -236,8 +240,11 @@ class RobotsTxtMiddleware:
 
     def _robots_error(self, exc: Exception, netloc: str, request: Request) -> None:
         if not isinstance(exc, IgnoreRequest):
-            logger.error(
+            log_with_projection(
+                logger,
+                logging.ERROR,
                 f"Error downloading {request}",
+                source=self.crawler,
                 exc_info=exc,
                 extra={"spider": self.crawler.spider},
             )

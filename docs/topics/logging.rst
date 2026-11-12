@@ -277,6 +277,14 @@ A custom log format can be set for different actions by extending
 :class:`~scrapy.logformatter.LogFormatter` class and making
 :setting:`LOG_FORMATTER` point to your new class.
 
+Requests, responses and exception text are projected before they are logged.
+Values of :setting:`LOG_SENSITIVE_QUERY_PARAMS` and
+:setting:`LOG_SENSITIVE_HEADERS` are replaced with ``[redacted]``, together
+with the default sensitive query keys and the default sensitive headers,
+including ``Authorization`` and ``Proxy-Authorization``. This applies to the
+default log messages, to messages written by a custom formatter, and to
+exception tracebacks, including exception chains.
+
 .. _topics-logging-advanced-customization:
 
 Advanced customization

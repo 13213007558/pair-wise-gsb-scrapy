@@ -24,6 +24,7 @@ from scrapy.utils._download_handlers import (
 )
 from scrapy.utils.defer import maybe_deferred_to_future
 from scrapy.utils.httpobj import urlparse_cached
+from scrapy.utils.log import log_with_projection
 
 if TYPE_CHECKING:
     from twisted.internet.base import DelayedCall
@@ -72,7 +73,12 @@ class H2DownloadHandler(BaseHttpDownloadHandler):
                 )
         except ResponseDataLossError:
             if not self._fail_on_dataloss_warned:
-                logger.warning(get_dataloss_msg(request.url))
+                log_with_projection(
+                    logger,
+                    logging.WARNING,
+                    get_dataloss_msg(request.url, source=self._crawler),
+                    source=self._crawler,
+                )
                 self._fail_on_dataloss_warned = True
             raise
 

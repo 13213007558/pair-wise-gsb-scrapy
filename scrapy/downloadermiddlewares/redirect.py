@@ -12,6 +12,7 @@ from scrapy.http import HtmlResponse, Response
 from scrapy.spidermiddlewares.referer import RefererMiddleware
 from scrapy.utils.decorators import _warn_spider_arg
 from scrapy.utils.httpobj import urlparse_cached
+from scrapy.utils.log import log_with_projection
 from scrapy.utils.python import global_object_name
 from scrapy.utils.response import _IGNORABLE_TAGS, _body_size, _get_meta_refresh
 from scrapy.utils.url import _redirect_url
@@ -113,15 +114,21 @@ class BaseRedirectMiddleware:
             ]
             redirected.dont_filter = request.dont_filter
             redirected.priority = request.priority + self.priority_adjust
-            logger.debug(
+            log_with_projection(
+                logger,
+                logging.DEBUG,
                 "Redirecting (%(reason)s) to %(redirected)s from %(request)s",
                 {"reason": reason, "redirected": redirected, "request": request},
+                source=self.crawler,
                 extra={"spider": self.crawler.spider},
             )
             return redirected
-        logger.debug(
+        log_with_projection(
+            logger,
+            logging.DEBUG,
             "Discarding %(request)s: max redirections reached",
             {"request": request},
+            source=self.crawler,
             extra={"spider": self.crawler.spider},
         )
         raise IgnoreRequest("max redirections reached")

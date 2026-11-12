@@ -70,6 +70,7 @@ from scrapy.utils._ssl import _log_ssl_conn_debug_info
 from scrapy.utils.defer import maybe_deferred_to_future
 from scrapy.utils.deprecate import warn_on_deprecated_spider_attribute
 from scrapy.utils.httpobj import urlparse_cached
+from scrapy.utils.log import log_with_projection
 
 from ._base_http import BaseHttpDownloadHandler
 
@@ -323,7 +324,12 @@ class HTTP11DownloadHandler(BaseHttpDownloadHandler):
                 return await maybe_deferred_to_future(agent.download_request(request))
         except ResponseDataLossError:
             if not self._fail_on_dataloss_warned:
-                logger.warning(get_dataloss_msg(request.url))
+                log_with_projection(
+                    logger,
+                    logging.WARNING,
+                    get_dataloss_msg(request.url, source=self._crawler),
+                    source=self._crawler,
+                )
                 self._fail_on_dataloss_warned = True
             raise
 
@@ -969,17 +975,24 @@ class _ScrapyAgent:
 
         if maxsize and expected_size > maxsize:
             warning_msg = get_maxsize_msg(
-                expected_size, maxsize, request, expected=True
+                expected_size, maxsize, request, expected=True, source=self._crawler
             )
-            logger.warning(warning_msg)
+            log_with_projection(
+                logger, logging.WARNING, warning_msg, source=self._crawler
+            )
             # Abort connection immediately.
             txresponse._transport._producer.abortConnection()
             raise DownloadCancelledError(warning_msg)
 
         reached_warnsize = bool(warnsize and expected_size > warnsize)
         if reached_warnsize:
-            logger.warning(
-                get_warnsize_msg(expected_size, warnsize, request, expected=True)
+            log_with_projection(
+                logger,
+                logging.WARNING,
+                get_warnsize_msg(
+                    expected_size, warnsize, request, expected=True, source=self._crawler
+                ),
+                source=self._crawler,
             )
 
         d: Deferred[_ResultT] = Deferred(partial(self._cancel, txresponse=txresponse))
@@ -1126,10 +1139,17 @@ class _ResponseReader(Protocol):
             self._finish_response(stop_download=stop_download)
 
         if self._maxsize and self._bytes_received > self._maxsize:
-            logger.warning(
+            log_with_projection(
+                logger,
+                logging.WARNING,
                 get_maxsize_msg(
-                    self._bytes_received, self._maxsize, self._request, expected=False
-                )
+                    self._bytes_received,
+                    self._maxsize,
+                    self._request,
+                    expected=False,
+                    source=self._crawler,
+                ),
+                source=self._crawler,
             )
             # Clear buffer earlier to avoid keeping data in memory for a long time.
             self._bodybuf.truncate(0)
@@ -1141,10 +1161,17 @@ class _ResponseReader(Protocol):
             and not self._reached_warnsize
         ):
             self._reached_warnsize = True
-            logger.warning(
+            log_with_projection(
+                logger,
+                logging.WARNING,
                 get_warnsize_msg(
-                    self._bytes_received, self._warnsize, self._request, expected=False
-                )
+                    self._bytes_received,
+                    self._warnsize,
+                    self._request,
+                    expected=False,
+                    source=self._crawler,
+                ),
+                source=self._crawler,
             )
 
     def connectionLost(self, reason: Failure = connectionDone) -> None:

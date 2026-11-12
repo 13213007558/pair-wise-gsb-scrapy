@@ -9,11 +9,13 @@ RETRY_HTTP_CODES - which HTTP response codes to retry
 
 from __future__ import annotations
 
+import logging
 from logging import Logger, getLevelNamesMapping, getLogger
 from typing import TYPE_CHECKING, Self
 
 from scrapy.exceptions import NotConfigured
 from scrapy.utils.decorators import _warn_spider_arg
+from scrapy.utils.log import log_with_projection
 from scrapy.utils.misc import _load_objects
 from scrapy.utils.python import global_object_name
 from scrapy.utils.response import response_status_message
@@ -98,9 +100,12 @@ def get_retry_request(
         if max_retry_times is None:
             max_retry_times = settings.getint("RETRY_TIMES")
     if retry_times <= max_retry_times:
-        logger.debug(
+        log_with_projection(
+            logger,
+            logging.DEBUG,
             "Retrying %(request)s (failed %(retry_times)d times): %(reason)s",
             {"request": request, "retry_times": retry_times, "reason": reason},
+            source=spider.crawler,
             extra={"spider": spider},
         )
         new_request: Request = request.copy()
@@ -127,10 +132,12 @@ def get_retry_request(
         give_up_log_level = level
     stats.inc_value(f"{stats_base_key}/max_reached")
     assert give_up_log_level is not None
-    logger.log(
+    log_with_projection(
+        logger,
         give_up_log_level,
         "Gave up retrying %(request)s (failed %(retry_times)d times): %(reason)s",
         {"request": request, "retry_times": retry_times, "reason": reason},
+        source=spider.crawler,
         extra={"spider": spider},
     )
     return None

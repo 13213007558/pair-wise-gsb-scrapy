@@ -11,6 +11,7 @@ from typing import TYPE_CHECKING, Any, Self
 
 from scrapy.exceptions import IgnoreRequest
 from scrapy.utils.decorators import _warn_spider_arg
+from scrapy.utils.log import log_with_projection
 
 if TYPE_CHECKING:
     from collections.abc import Iterable
@@ -83,9 +84,12 @@ class HttpErrorMiddleware:
             stats.inc_value(
                 f"httperror/response_ignored_status_count/{response.status}"
             )
-            logger.info(
+            log_with_projection(
+                logger,
+                logging.INFO,
                 "Ignoring response %(response)r: HTTP status code is not handled or not allowed",
                 {"response": response},
+                source=self.crawler,
                 extra={"spider": self.crawler.spider},
             )
             return ()

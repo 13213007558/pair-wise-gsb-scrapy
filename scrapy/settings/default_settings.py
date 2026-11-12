@@ -160,6 +160,8 @@ __all__ = [
     "LOG_LEVEL",
     "LOG_LEVELS",
     "LOG_ROOT_FORMATTER",
+    "LOG_SENSITIVE_HEADERS",
+    "LOG_SENSITIVE_QUERY_PARAMS",
     "LOG_SHORT_NAMES",
     "LOG_STDOUT",
     "LOG_VERSIONS",
@@ -502,6 +504,8 @@ LOG_FORMATTER = "scrapy.logformatter.LogFormatter"
 LOG_LEVEL = "DEBUG"
 LOG_LEVELS: dict[str, str] = {}
 LOG_ROOT_FORMATTER = "scrapy.LogRootFormatter"
+LOG_SENSITIVE_HEADERS: tuple[str, ...] = ()
+LOG_SENSITIVE_QUERY_PARAMS: tuple[str, ...] = ()
 LOG_SHORT_NAMES = False
 LOG_STDOUT = False
 LOG_VERSIONS = [

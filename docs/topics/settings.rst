@@ -407,6 +407,8 @@ These settings are:
 -   :setting:`LOG_LEVEL`
 -   :setting:`LOG_LEVELS`
 -   :setting:`LOG_ROOT_FORMATTER`
+-   :setting:`LOG_SENSITIVE_HEADERS`
+-   :setting:`LOG_SENSITIVE_QUERY_PARAMS`
 -   :setting:`LOG_SHORT_NAMES`
 -   :setting:`LOG_STDOUT`
 
@@ -1862,16 +1864,57 @@ It takes precedence over the levels that Scrapy sets by default::
 
 .. note:: This is a :ref:`logging setting <logging-settings>`.
 
-.. setting:: LOG_STDOUT
+.. setting:: LOG_SENSITIVE_HEADERS
 
-LOG_STDOUT
-----------
+LOG_SENSITIVE_HEADERS
+---------------------
 
-Default: ``False``
+.. versionadded:: VERSION
 
-If ``True``, all standard output (and error) of your process will be redirected
-to the log. For example if you ``print('hello')`` it will appear in the Scrapy
-log.
+Default: ``()``
+
+Request and response header names whose values are hidden from log output.
+Matching is case-insensitive, like header lookups in Scrapy.
+
+``Authorization``, ``Proxy-Authorization``, ``X-Api-Key``, ``X-Auth-Token``
+and ``X-Amz-Security-Token`` are always hidden. Use this setting for your own
+headers, for example::
+
+    LOG_SENSITIVE_HEADERS = ["X-Api-Key", "X-Session-Token"]
+
+Header values are replaced with ``[redacted]`` in log messages, including
+messages produced by a custom :setting:`LOG_FORMATTER` and messages that embed
+an exception or a response.
+
+The setting does not change requests or responses. Headers are only hidden
+when they are logged, they are still sent and processed normally.
+
+.. note:: This is a :ref:`logging setting <logging-settings>`.
+
+.. setting:: LOG_SENSITIVE_QUERY_PARAMS
+
+LOG_SENSITIVE_QUERY_PARAMS
+--------------------------
+
+.. versionadded:: VERSION
+
+Default: ``()``
+
+Query string keys whose values are hidden from log output. Matching is
+case-insensitive.
+
+The values of ``access_token``, ``api_key``, ``apikey``, ``auth``, ``key``,
+``password``, ``secret``, ``signature`` and ``token`` are always hidden. Use
+this setting for your own keys, for example::
+
+    LOG_SENSITIVE_QUERY_PARAMS = ["session", "sid"]
+
+Query values are replaced with ``[redacted]`` in log messages. The key, the
+rest of the query string and the path remain visible, so a retry or a failure
+can still be traced to the request that caused it.
+
+The setting does not change requests or responses. Query values are only
+hidden when they are logged, they are still sent normally.
 
 .. note:: This is a :ref:`logging setting <logging-settings>`.
 
@@ -1884,6 +1927,19 @@ Default: ``False``
 
 If ``True``, the logs will just contain the root path. If it is set to ``False``
 then it displays the component responsible for the log output
+
+.. note:: This is a :ref:`logging setting <logging-settings>`.
+
+.. setting:: LOG_STDOUT
+
+LOG_STDOUT
+----------
+
+Default: ``False``
+
+If ``True``, all standard output (and error) of your process will be redirected
+to the log. For example if you ``print('hello')`` it will appear in the Scrapy
+log.
 
 .. note:: This is a :ref:`logging setting <logging-settings>`.
 

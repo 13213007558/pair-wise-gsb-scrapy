@@ -25,6 +25,7 @@ from scrapy.exceptions import (
     UnsupportedURLSchemeError,
 )
 from scrapy.http import BodyFileResponse, Headers
+from scrapy.utils._log_projection import _LogProjection
 from scrapy.utils.log import logger
 
 if TYPE_CHECKING:
@@ -131,11 +132,19 @@ def make_response(
     return response
 
 
-def get_maxsize_msg(size: int, limit: int, request: Request, *, expected: bool) -> str:
+def get_maxsize_msg(
+    size: int,
+    limit: int,
+    request: Request,
+    *,
+    expected: bool,
+    source: Any = None,
+) -> str:
     prefix = "Expected to receive" if expected else "Received"
+    projected_request = _LogProjection.from_crawler(source).project_request(request)
     return (
         f"{prefix} {size} bytes which is larger than download "
-        f"max size ({limit}) in request {request}."
+        f"max size ({limit}) in request {projected_request}."
     )
 
 
@@ -153,19 +162,28 @@ def get_warnsize(meta: dict[str, Any], default: int) -> int:
     return default
 
 
-def get_warnsize_msg(size: int, limit: int, request: Request, *, expected: bool) -> str:
+def get_warnsize_msg(
+    size: int,
+    limit: int,
+    request: Request,
+    *,
+    expected: bool,
+    source: Any = None,
+) -> str:
     prefix = "Expected to receive" if expected else "Received"
+    projected_request = _LogProjection.from_crawler(source).project_request(request)
     return (
         f"{prefix} {size} bytes which is larger than download "
-        f"warn size ({limit}) in request {request}."
+        f"warn size ({limit}) in request {projected_request}."
     )
 
 
-def get_dataloss_msg(url: str) -> str:
+def get_dataloss_msg(url: str, *, source: Any = None) -> str:
     return (
-        f"Got data loss in {url}. If you want to process broken "
-        f"responses set the setting DOWNLOAD_FAIL_ON_DATALOSS = False"
-        f" -- This message won't be shown in further requests"
+        f"Got data loss in {_LogProjection.from_crawler(source).project_url(url)}."
+        f" If you want to process broken responses set the setting"
+        f" DOWNLOAD_FAIL_ON_DATALOSS = False -- This message won't be shown"
+        f" in further requests"
     )
 
 

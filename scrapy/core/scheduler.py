@@ -11,6 +11,7 @@ from twisted.internet.defer import Deferred
 from scrapy.spiders import Spider  # noqa: TC001
 from scrapy.utils.conf import _job_dir
 from scrapy.utils.defer import ensure_awaitable
+from scrapy.utils.log import log_with_projection
 from scrapy.utils.misc import build_from_crawler, load_object
 from scrapy.utils.python import global_object_name
 
@@ -491,9 +492,12 @@ class Scheduler(BaseScheduler):
                     " %(reason)s - no more unserializable requests will be"
                     " logged (stats being collected)"
                 )
-                logger.warning(
+                log_with_projection(
+                    logger,
+                    logging.WARNING,
                     msg,
                     {"request": request, "reason": e},
+                    source=self.crawler,
                     exc_info=True,
                     extra={"spider": self.spider},
                 )

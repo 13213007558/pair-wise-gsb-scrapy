@@ -5,7 +5,7 @@ import pprint
 import re
 import sys
 import warnings
-from collections.abc import MutableMapping
+from collections.abc import Mapping, MutableMapping
 from logging.config import dictConfig
 from typing import TYPE_CHECKING, Any, cast
 
@@ -17,6 +17,11 @@ import scrapy
 from scrapy.exceptions import ScrapyDeprecationWarning
 from scrapy.settings import Settings
 from scrapy.utils._colorize import tty_supports_color
+from scrapy.utils._log_projection import (
+    _get_default_projection,
+    _LogProjection,
+    _project_exc_info,
+)
 from scrapy.utils._versions import get_versions
 from scrapy.utils.misc import load_object
 
@@ -325,39 +330,152 @@ class LogCounterHandler(logging.Handler):
 _MSG_MAPPING_PLACEHOLDER = re.compile(r"%\(\w+\)")
 
 
+def _logformatter_parts(
+    logkws: LogFormatterResult,
+) -> tuple[Any, str, dict[str, Any] | tuple[Any, ...] | None]:
+    level = logkws.get("level", logging.INFO)
+    message = logkws.get("msg") or ""
+    args = logkws.get("args")
+    if not args and _MSG_MAPPING_PLACEHOLDER.search(message):
+        # The log formatter method has already returned, so there is no frame
+        # of it left in the stack to point at. msg is part of the warning
+        # message instead, so that each offending method gets its own warning.
+        warnings.warn(
+            f"A log formatter method returned msg {message!r} with "
+            f"%(name)s placeholders and no args. Interpolating msg with "
+            f"the returned dict is deprecated, return those values under "
+            f"args instead.",
+            ScrapyDeprecationWarning,
+            stacklevel=2,
+        )
+        return (level, message, logkws)
+    return (level, message, args)
+
+
 def logformatter_adapter(
     logkws: LogFormatterResult,
+    *,
+    crawler: Crawler | None = None,
 ) -> tuple[Any, ...]:
     """
     Helper that takes the dictionary output from the methods in LogFormatter
     and adapts it into a tuple of positional arguments for logger.log calls.
+
+    The message arguments are projected so that sensitive request data is
+    hidden, even when the formatter returns the request object itself.
     """
 
-    level = logkws.get("level", logging.INFO)
-    message = logkws.get("msg") or ""
-    args = logkws.get("args")
+    level, message, args = _logformatter_parts(logkws)
+    if not args:
+        return (level, message)
+    projection = _get_projection(logkws, crawler)
     # logging interpolates the message whenever it receives any positional
     # argument, so empty args are left out. Tuple args become one positional
     # argument each, while a dict is a single positional argument.
-    if not args:
-        if _MSG_MAPPING_PLACEHOLDER.search(message):
-            # The log formatter method has already returned, so there is no
-            # frame of it left in the stack to point at. msg is part of the
-            # warning message instead, so that each offending method gets its
-            # own warning.
-            warnings.warn(
-                f"A log formatter method returned msg {message!r} with "
-                f"%(name)s placeholders and no args. Interpolating msg with "
-                f"the returned dict is deprecated, return those values under "
-                f"args instead.",
-                ScrapyDeprecationWarning,
-                stacklevel=1,
-            )
-            return (level, message, logkws)
-        return (level, message)
     if isinstance(args, tuple):
-        return (level, message, *args)
-    return (level, message, args)
+        return (
+            level,
+            message,
+            *(projection.project_value(value) for value in args),
+        )
+    return (level, message, projection.project_args(args))
+
+
+def _get_projection(
+    logkws: LogFormatterResult, crawler: Crawler | None
+) -> _LogProjection:
+    if crawler is not None:
+        return _LogProjection.from_crawler(crawler)
+    return _get_default_projection()
+
+
+def log_with_projection(
+    logger: logging.Logger,
+    level: int,
+    msg: str,
+    args: Mapping[str, Any] | tuple[Any, ...] | None = None,
+    *,
+    source: Any = None,
+    exc_info: (
+        bool
+        | BaseException
+        | tuple[type[BaseException], BaseException, TracebackType | None]
+        | None
+    ) = None,
+    extra: Mapping[str, Any] | None = None,
+) -> None:
+    """Log a request-related message after projecting it.
+
+    *source* is the crawler whose :setting:`LOG_SENSITIVE_HEADERS` and
+    :setting:`LOG_SENSITIVE_QUERY_PARAMS` settings apply. When it is ``None``,
+    or when it has no such settings, only the defaults are hidden.
+
+    Exception information is projected too, including exception chains and
+    notes, so an exception handler cannot bypass the rules by logging the
+    original exception.
+    """
+    projection = (
+        _LogProjection.from_crawler(source)
+        if _has_projection_settings(source)
+        else _get_default_projection()
+    )
+    msg = projection.project_text(msg)
+    projected_args = projection.project_args(args) if args is not None else None
+    projected_extra = (
+        {key: projection.project_value(value) for key, value in extra.items()}
+        if extra is not None
+        else None
+    )
+    projected_exc_info = _project_exc_info(projection, exc_info)
+    if projected_args is None:
+        logger.log(level, msg, extra=projected_extra, exc_info=projected_exc_info)
+    elif isinstance(projected_args, tuple):
+        logger.log(
+            level,
+            msg,
+            *projected_args,
+            extra=projected_extra,
+            exc_info=projected_exc_info,
+        )
+    else:
+        logger.log(
+            level,
+            msg,
+            projected_args,
+            extra=projected_extra,
+            exc_info=projected_exc_info,
+        )
+
+
+def log_formatter_result(
+    logger: logging.Logger,
+    logkws: LogFormatterResult,
+    *,
+    crawler: Crawler,
+    extra: Mapping[str, Any] | None = None,
+    exc_info: (
+        bool
+        | BaseException
+        | tuple[type[BaseException], BaseException, TracebackType | None]
+        | None
+    ) = None,
+) -> None:
+    """Log the result of a :class:`~scrapy.logformatter.LogFormatter` method."""
+    level, message, args = _logformatter_parts(logkws)
+    log_with_projection(
+        logger,
+        level,
+        message,
+        args,
+        source=crawler,
+        exc_info=exc_info,
+        extra=extra,
+    )
+
+
+def _has_projection_settings(source: Any) -> bool:
+    settings = getattr(source, "settings", None)
+    return settings is not None and hasattr(settings, "getlist")
 
 
 class SpiderLoggerAdapter(logging.LoggerAdapter[logging.Logger]):

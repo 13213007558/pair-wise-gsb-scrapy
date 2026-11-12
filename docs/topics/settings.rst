@@ -1274,6 +1274,14 @@ This applies both before and after compression. If decompressing a response
 body would exceed this limit, decompression is aborted and the response is
 ignored.
 
+When a response uses ``Content-Encoding``, this limit is also the total
+decompression work allowed for it, not just the size of the final body. The
+bytes that each content coding produces are added up, including intermediate
+results and the content of every member or segment of a compressed body, and
+decompression stops as soon as that total would exceed the limit. This bounds
+the CPU and memory that a response with several content codings or a
+high-expansion payload can consume, even when the final body would fit.
+
 Use ``0`` to disable this limit.
 
 .. note::

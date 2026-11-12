@@ -476,6 +476,39 @@ one per actual value of the placeholder.
     Set by
     :class:`~scrapy.downloadermiddlewares.httpcompression.HttpCompressionMiddleware`.
 
+.. stat:: httpcompression/work_bytes
+
+``httpcompression/work_bytes``
+    Total decompression work, in bytes, of the responses that
+    :class:`~scrapy.downloadermiddlewares.httpcompression.HttpCompressionMiddleware`
+    decompressed or dropped during decompression. It adds up the bytes that
+    every content coding of a response produced, including intermediate
+    results, so it is larger than
+    :stat:`httpcompression/response_bytes` for responses with multiple content
+    codings. For a response dropped because it exceeded
+    :setting:`DOWNLOAD_MAXSIZE`, it includes the work done up to the point of
+    rejection.
+
+    .. versionadded:: 2.20.0
+
+    Set by
+    :class:`~scrapy.downloadermiddlewares.httpcompression.HttpCompressionMiddleware`.
+
+.. stat:: httpcompression/layer_bytes/{layer}
+
+``httpcompression/layer_bytes/{layer}``
+    Total decompression work, in bytes, of each content coding layer of the
+    responses that
+    :class:`~scrapy.downloadermiddlewares.httpcompression.HttpCompressionMiddleware`
+    decompressed, where ``{layer}`` is the 1-based position of the content
+    coding in decoding order. For example, ``httpcompression/layer_bytes/2``
+    counts the bytes produced by the second content coding that was decoded.
+
+    .. versionadded:: 2.20.0
+
+    Set by
+    :class:`~scrapy.downloadermiddlewares.httpcompression.HttpCompressionMiddleware`.
+
 .. stat:: httperror/response_ignored_count
 
 ``httperror/response_ignored_count``

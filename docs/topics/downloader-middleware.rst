@@ -825,7 +825,9 @@ more codings than this is dropped with :exc:`~scrapy.exceptions.IgnoreRequest`.
 
 Raise it only to scrape servers that legitimately apply multiple codings to a
 response, keeping in mind that a high value lets a malicious server force many
-decompression passes.
+decompression passes. The work that each content coding does counts towards the
+:setting:`DOWNLOAD_MAXSIZE` limit of the response, so several codings use up
+that limit faster than a single one.
 
 
 HttpProxyMiddleware

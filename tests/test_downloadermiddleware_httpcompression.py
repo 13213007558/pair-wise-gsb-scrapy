@@ -23,7 +23,13 @@ from scrapy.exceptions import (
 from scrapy.http import BodyFileResponse, HtmlResponse, Request, Response
 from scrapy.responsetypes import responsetypes
 from scrapy.spiders import Spider
-from scrapy.utils._compression import _CHUNK_SIZE, _DecompressionMaxSizeExceeded, gunzip
+from scrapy.utils._compression import (
+    _CHUNK_SIZE,
+    _DecompressionBudget,
+    _DecompressionBudgetExceeded,
+    _DecompressionMaxSizeExceeded,
+    gunzip,
+)
 from scrapy.utils.misc import build_from_crawler
 from scrapy.utils.test import get_crawler
 from tests import tests_datadir
@@ -58,6 +64,13 @@ FORMAT = {
         )
     },
 }
+
+
+def gzip_bytes(data: bytes) -> bytes:
+    buf = BytesIO()
+    with GzipFile(fileobj=buf, mode="wb") as f:
+        f.write(data)
+    return buf.getvalue()
 
 
 class TestHttpCompression:
@@ -606,12 +619,125 @@ class TestHttpCompression:
         with pytest.raises(IgnoreRequest) as exc_info:
             await mw.process_response(response.request, response)
         cause = exc_info.value.__cause__
+        assert isinstance(cause, _DecompressionBudgetExceeded)
         assert isinstance(cause, _DecompressionMaxSizeExceeded)
         assert cause.decompressed_size < 1_100_000
+        assert cause.layer_sizes == (cause.decompressed_size,)
         assert str(cause) == (
-            f"The number of bytes decompressed so far ({cause.decompressed_size} B) "
-            "exceeded the specified maximum (1000000 B)."
+            f"The cumulative decompression work ({cause.decompressed_size} B) "
+            "exceeded the specified maximum (1000000 B); produced per content "
+            f"coding: {cause.decompressed_size} B."
         )
+
+    @coroutine_test
+    async def test_compression_budget_accumulates_across_layers(self) -> None:
+        plain = b"x" * 1000
+        body = gzip_bytes(gzip_bytes(plain))
+        response = Response(
+            "http://example.com",
+            body=body,
+            headers={"Content-Encoding": "gzip, gzip"},
+        )
+        request = Request("http://example.com", meta={"download_maxsize": 1028})
+        with pytest.raises(IgnoreRequest) as exc_info:
+            await self._mw(2).process_response(request, response)
+        cause = exc_info.value.__cause__
+        assert isinstance(cause, _DecompressionBudgetExceeded)
+        assert cause.decompressed_size == 1029
+        assert cause.layer_sizes == (29, 1000)
+        assert (
+            "1029 B produced so far across 2 content coding(s) (29 B, 1000 B)"
+            in str(exc_info.value)
+        )
+
+    @coroutine_test
+    async def test_compression_budget_exact_limit_passes(self) -> None:
+        plain = b"x" * 1000
+        body = gzip_bytes(plain)
+        response = Response(
+            "http://example.com",
+            body=body,
+            headers={"Content-Encoding": "gzip"},
+        )
+        request = Request("http://example.com", meta={"download_maxsize": 1000})
+        newresponse = await self.mw.process_response(request, response)
+        assert newresponse.body == plain
+        self.assertStatsEqual("httpcompression/work_bytes", 1000)
+        self.assertStatsEqual("httpcompression/layer_bytes/1", 1000)
+        self.assertStatsEqual("httpcompression/response_bytes", 1000)
+        self.assertStatsEqual("httpcompression/response_count", 1)
+
+    @coroutine_test
+    async def test_compression_budget_logs_each_layer(self) -> None:
+        plain = b"x" * 1000
+        response = Response(
+            "http://scrapytest.org/",
+            body=gzip_bytes(gzip_bytes(plain)),
+            headers={"Content-Encoding": "gzip, gzip"},
+        )
+        request = Request("http://scrapytest.org/", meta={"download_maxsize": 1028})
+        with pytest.raises(IgnoreRequest) as exc_info:
+            await self._mw(2).process_response(request, response)
+        expected = "1029 B produced so far across 2 content coding(s) (29 B, 1000 B)"
+        assert expected in str(exc_info.value)
+
+    @coroutine_test
+    async def test_compression_budget_rejection_keeps_response(self) -> None:
+        plain = b"SECRET-" + b"x" * 1000 + b"-SECRET"
+        body = gzip_bytes(plain)
+        response = Response(
+            "http://example.com",
+            body=body,
+            headers={"Content-Encoding": "gzip"},
+        )
+        request = Request("http://example.com", meta={"download_maxsize": 999})
+        with pytest.raises(IgnoreRequest) as exc_info:
+            await self.mw.process_response(request, response)
+        cause = exc_info.value.__cause__
+        assert isinstance(cause, _DecompressionBudgetExceeded)
+        assert response.body == body
+        assert response.headers.getlist("Content-Encoding") == [b"gzip"]
+        assert "SECRET" not in str(exc_info.value)
+        assert "SECRET" not in str(cause)
+        assert "SECRET" not in repr(cause)
+
+    @coroutine_test
+    async def test_compression_budget_log_has_no_body(self, caplog) -> None:
+        plain = b"SENSITIVE-PAYLOAD-" + b"x" * 1000
+        response = Response(
+            "http://scrapytest.org/",
+            body=gzip_bytes(plain),
+            headers={"Content-Encoding": "gzip"},
+        )
+        request = Request("http://scrapytest.org/", meta={"download_maxsize": 1000})
+        caplog.clear()
+        with (
+            caplog.at_level(
+                WARNING, logger="scrapy.downloadermiddlewares.httpcompression"
+            ),
+            pytest.raises(IgnoreRequest),
+        ):
+            await self.mw.process_response(request, response)
+        assert len(caplog.records) == 1
+        assert "SENSITIVE" not in caplog.text
+        assert "cumulative work" in caplog.text
+
+    @coroutine_test
+    async def test_compression_budget_gzip_members(self) -> None:
+        plain = b"y" * 5000
+        body = gzip_bytes(plain) + gzip_bytes(plain)
+        response = Response(
+            "http://example.com",
+            body=body,
+            headers={"Content-Encoding": "gzip"},
+        )
+        request = Request("http://example.com", meta={"download_maxsize": 6000})
+        with pytest.raises(IgnoreRequest) as exc_info:
+            await self.mw.process_response(request, response)
+        cause = exc_info.value.__cause__
+        assert isinstance(cause, _DecompressionBudgetExceeded)
+        assert cause.decompressed_size == 6001
+        assert cause.layer_sizes == (6001,)
 
     @coroutine_test
     async def test_compression_bomb_setting_br(self):
@@ -669,7 +795,7 @@ class TestHttpCompression:
         with pytest.raises(IgnoreRequest) as exc_info:
             await mw.process_response(response.request, response)
         cause = exc_info.value.__cause__
-        assert isinstance(cause, _DecompressionMaxSizeExceeded)
+        assert isinstance(cause, _DecompressionBudgetExceeded)
         assert cause.decompressed_size < 1_100_000
 
     @pytest.mark.filterwarnings("ignore::scrapy.exceptions.ScrapyDeprecationWarning")
@@ -704,7 +830,7 @@ class TestHttpCompression:
         with pytest.raises(IgnoreRequest) as exc_info:
             await mw.process_response(response.request, response)
         cause = exc_info.value.__cause__
-        assert isinstance(cause, _DecompressionMaxSizeExceeded)
+        assert isinstance(cause, _DecompressionBudgetExceeded)
         assert cause.decompressed_size < 1_100_000
 
     @coroutine_test

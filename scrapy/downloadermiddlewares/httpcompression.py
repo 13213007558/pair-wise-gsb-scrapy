@@ -16,7 +16,8 @@ from scrapy.http import BodyFileResponse, Response, TextResponse
 from scrapy.responsetypes import responsetypes
 from scrapy.utils._compression import (
     _DECOMPRESSION_ERRORS,
-    _DecompressionMaxSizeExceeded,
+    _DecompressionBudget,
+    _DecompressionBudgetExceeded,
     _inflate,
     _unbrotli,
     _unzstd,
@@ -114,16 +115,20 @@ class HttpCompressionMiddleware:
         if content_encoding:
             max_size = request.meta.get("download_maxsize", self._max_size)
             warn_size = get_warnsize(request.meta, self._warn_size)
+            budget = _DecompressionBudget(max_size)
             try:
                 decoded_body, content_encoding = await self._handle_encoding(
-                    response.body, content_encoding, max_size
+                    response.body, content_encoding, budget
                 )
-            except _DecompressionMaxSizeExceeded as e:
+            except _DecompressionBudgetExceeded as e:
+                self._inc_work_stats(e.layer_sizes)
                 msg = (
-                    f"Ignored response {response} because its body "
-                    f"({len(response.body)} B compressed, "
-                    f"{e.decompressed_size} B decompressed so far) exceeded "
-                    f"DOWNLOAD_MAXSIZE ({max_size} B) during decompression."
+                    f"Ignored response {response} because decompressing its body "
+                    f"({len(response.body)} B compressed) needed more than "
+                    f"DOWNLOAD_MAXSIZE ({max_size} B) in cumulative work: "
+                    f"{e.decompressed_size} B produced so far across "
+                    f"{len(e.layer_sizes)} content coding(s) "
+                    f"({', '.join(f'{size} B' for size in e.layer_sizes)})."
                 )
                 logger.warning(msg)
                 raise IgnoreRequest(msg) from e
@@ -155,6 +160,7 @@ class HttpCompressionMiddleware:
                     len(decoded_body),
                 )
                 self.stats.inc_value("httpcompression/response_count")
+                self._inc_work_stats(budget.layer_sizes)
             respcls = responsetypes.from_args(
                 headers=response.headers, url=response.url, body=decoded_body
             )
@@ -169,16 +175,19 @@ class HttpCompressionMiddleware:
         return response
 
     async def _handle_encoding(
-        self, body: bytes, content_encoding: list[bytes], max_size: int
+        self, body: bytes, content_encoding: list[bytes], budget: _DecompressionBudget
     ) -> tuple[bytes, list[bytes]]:
         to_decode, to_keep = self._split_encodings(content_encoding)
         if len(to_decode) > self._max_encodings:
             raise _MaxEncodingCountExceeded(len(to_decode), self._max_encodings)
         for encoding in to_decode:
+            layer = budget.start_layer()
             if len(body) >= _THREAD_DECODE_MIN_SIZE:
-                body = await run_in_thread(self._decode, body, encoding, max_size)
+                body = await run_in_thread(
+                    self._decode, body, encoding, budget, layer
+                )
             else:
-                body = self._decode(body, encoding, max_size)
+                body = self._decode(body, encoding, budget, layer)
         return body, to_keep
 
     @staticmethod
@@ -202,17 +211,26 @@ class HttpCompressionMiddleware:
         return to_decode, to_keep
 
     @staticmethod
-    def _decode(body: bytes, encoding: bytes, max_size: int) -> bytes:
+    def _decode(
+        body: bytes, encoding: bytes, budget: _DecompressionBudget, layer: int
+    ) -> bytes:
         if encoding in {b"gzip", b"x-gzip"}:
-            return gunzip(body, max_size=max_size)
+            return gunzip(body, budget=budget, layer=layer)
         if encoding == b"deflate":
-            return _inflate(body, max_size=max_size)
+            return _inflate(body, budget=budget, layer=layer)
         if encoding == b"br":
-            return _unbrotli(body, max_size=max_size)
+            return _unbrotli(body, budget=budget, layer=layer)
         if encoding == b"zstd":
-            return _unzstd(body, max_size=max_size)
+            return _unzstd(body, budget=budget, layer=layer)
         # shouldn't be reached
         return body  # pragma: no cover
+
+    def _inc_work_stats(self, layer_sizes: tuple[int, ...]) -> None:
+        if not self.stats:
+            return
+        self.stats.inc_value("httpcompression/work_bytes", sum(layer_sizes))
+        for index, size in enumerate(layer_sizes, 1):
+            self.stats.inc_value(f"httpcompression/layer_bytes/{index}", size)
 
     def _warn_unknown_encoding(
         self, response: Response, encodings: list[bytes]

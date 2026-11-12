@@ -1,13 +1,19 @@
 from __future__ import annotations
 
-from gzip import BadGzipFile
+from gzip import BadGzipFile, GzipFile
+from io import BytesIO
 from pathlib import Path
 
 import pytest
 from w3lib.encoding import html_to_unicode
 
 from scrapy.http import Response
-from scrapy.utils._compression import gunzip, gzip_magic_number
+from scrapy.utils._compression import (
+    _DecompressionBudget,
+    _DecompressionBudgetExceeded,
+    gunzip,
+    gzip_magic_number,
+)
 from tests import tests_datadir
 
 SAMPLEDIR = Path(tests_datadir, "compressed")
@@ -61,3 +67,31 @@ def test_gunzip_illegal_eof():
     )
     assert len(text) == len(expected_text)
     assert text == expected_text
+
+
+def _gzip_bytes(data: bytes) -> bytes:
+    buf = BytesIO()
+    with GzipFile(fileobj=buf, mode="wb") as f:
+        f.write(data)
+    return buf.getvalue()
+
+
+def test_budget_shared_across_calls_and_members():
+    plain = b"a" * 5000
+    body = _gzip_bytes(plain) + _gzip_bytes(plain)
+    budget = _DecompressionBudget(9000)
+    layer = budget.start_layer()
+    with pytest.raises(_DecompressionBudgetExceeded) as exc_info:
+        gunzip(body, budget=budget, layer=layer)
+    assert exc_info.value.decompressed_size == 9001
+    assert exc_info.value.layer_sizes == (9001,)
+    assert budget.decompressed_size == 9001
+
+
+def test_budget_allows_exact_limit():
+    plain = b"b" * 5000
+    body = _gzip_bytes(plain) + _gzip_bytes(plain)
+    budget = _DecompressionBudget(10_000)
+    layer = budget.start_layer()
+    assert gunzip(body, budget=budget, layer=layer) == plain * 2
+    assert budget.decompressed_size == 10_000

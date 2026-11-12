@@ -1,15 +1,20 @@
 from __future__ import annotations
 
-from typing import Any
+import asyncio
+from typing import TYPE_CHECKING, Any
 
 import pytest
 
+from scrapy.core.downloader.middleware import DownloaderMiddlewareManager
 from scrapy.downloadermiddlewares.httpauth import HttpAuthMiddleware
 from scrapy.exceptions import ScrapyDeprecationWarning
-from scrapy.http import Request
+from scrapy.http import Request, Response
 from scrapy.spiders import Spider
 from scrapy.utils.misc import build_from_crawler
 from scrapy.utils.test import get_crawler
+
+if TYPE_CHECKING:
+    from collections.abc import Sequence
 
 
 def _build_mw(settings: dict[str, Any], spider: Spider) -> HttpAuthMiddleware:
@@ -290,3 +295,136 @@ def test_origin_setdefault(
         assert "_auth_origin" not in request.meta
     else:
         assert request.meta["_auth_origin"] == output_value
+
+
+async def _follow_redirects(
+    settings: dict[str, Any],
+    request: Request,
+    locations: dict[str, str],
+) -> list[tuple[str, bytes | None]]:
+    """Run the full default downloader middleware chain, following redirect
+    requests the way the engine does, and report the Authorization header that
+    reaches the (in-memory) downloader on every hop."""
+    crawler = get_crawler(Spider, settings)
+    crawler.spider = crawler._create_spider("foo")
+    manager = build_from_crawler(DownloaderMiddlewareManager, crawler)
+
+    wire: list[tuple[str, bytes | None]] = []
+
+    async def download_func(current: Request) -> Response:
+        wire.append((current.url, current.headers.get("Authorization")))
+        location = locations.get(current.url)
+        if location is None:
+            return Response(current.url, status=200)
+        return Response(current.url, status=302, headers={"Location": location})
+
+    for _ in range(len(locations) + 1):
+        result = await manager.download_async(download_func, request)
+        if not isinstance(result, Request):
+            break
+        request = result
+    return wire
+
+
+@pytest.mark.parametrize(
+    ("settings", "request_kwargs", "locations", "expected"),
+    [
+        # Per-request credentials without an explicit domain are pinned to the
+        # origin of the first request: a same-origin redirect keeps them, a
+        # cross-origin one loses them and the middleware does not re-add them.
+        (
+            {},
+            {"meta": {"http_user": "mu", "http_pass": "mp"}},
+            {"https://a.example/1": "https://a.example/2"},
+            [
+                ("https://a.example/1", b"Basic bXU6bXA="),
+                ("https://a.example/2", b"Basic bXU6bXA="),
+            ],
+        ),
+        (
+            {},
+            {"meta": {"http_user": "mu", "http_pass": "mp"}},
+            {"https://a.example/1": "https://b.example/2"},
+            [
+                ("https://a.example/1", b"Basic bXU6bXA="),
+                ("https://b.example/2", None),
+            ],
+        ),
+        # A different port or scheme is a different origin, so the credentials
+        # are not re-added either.
+        (
+            {},
+            {"meta": {"http_user": "mu", "http_pass": "mp"}},
+            {"https://a.example/1": "https://a.example:8443/2"},
+            [
+                ("https://a.example/1", b"Basic bXU6bXA="),
+                ("https://a.example:8443/2", None),
+            ],
+        ),
+        # Middleware-level credentials scoped to a domain follow every redirect
+        # within that domain (including subdomains) and are dropped outside it.
+        (
+            {
+                "HTTPAUTH_USER": "cu",
+                "HTTPAUTH_PASS": "cp",
+                "HTTPAUTH_DOMAIN": "a.example",
+            },
+            {},
+            {
+                "https://a.example/1": "https://sub.a.example/2",
+                "https://sub.a.example/2": "https://b.example/3",
+            },
+            [
+                ("https://a.example/1", b"Basic Y3U6Y3A="),
+                ("https://sub.a.example/2", b"Basic Y3U6Y3A="),
+                ("https://b.example/3", None),
+            ],
+        ),
+        # With HTTPAUTH_DOMAIN=None the credentials are deliberately sent to
+        # every domain, including cross-origin redirect targets.
+        (
+            {
+                "HTTPAUTH_USER": "cu",
+                "HTTPAUTH_PASS": "cp",
+                "HTTPAUTH_DOMAIN": None,
+            },
+            {},
+            {"https://a.example/1": "https://b.example/2"},
+            [
+                ("https://a.example/1", b"Basic Y3U6Y3A="),
+                ("https://b.example/2", b"Basic Y3U6Y3A="),
+            ],
+        ),
+        # An explicit Authorization header is preserved on a same-origin
+        # redirect and stripped on a cross-origin one, with nothing re-added
+        # when no credentials are configured.
+        (
+            {},
+            {"headers": {"Authorization": "Bearer user-token"}},
+            {"https://a.example/1": "https://a.example/2"},
+            [
+                ("https://a.example/1", b"Bearer user-token"),
+                ("https://a.example/2", b"Bearer user-token"),
+            ],
+        ),
+        (
+            {},
+            {"headers": {"Authorization": "Bearer user-token"}},
+            {"https://a.example/1": "https://b.example/2"},
+            [
+                ("https://a.example/1", b"Bearer user-token"),
+                ("https://b.example/2", None),
+            ],
+        ),
+    ],
+)
+def test_authorization_on_redirect(
+    settings: dict[str, Any],
+    request_kwargs: dict[str, Any],
+    locations: dict[str, str],
+    expected: Sequence[tuple[str, bytes | None]],
+) -> None:
+    start_url = next(iter(locations))
+    request = Request(start_url, **request_kwargs)
+    wire = asyncio.run(_follow_redirects(settings, request, locations))
+    assert wire == list(expected)
